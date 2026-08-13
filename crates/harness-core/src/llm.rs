@@ -71,19 +71,15 @@ impl LlmAdapter for NullAdapter {
     async fn stream(&self, _request: LlmRequest) -> anyhow::Result<mpsc::Receiver<StreamFrame>> {
         let (tx, rx) = mpsc::channel(16);
         let message_id = Uuid::new_v4();
-        tokio::spawn(async move {
-            let _ = tx
-                .send(StreamFrame::Delta {
-                    message_id,
-                    text: "No model adapter configured.".into(),
-                })
-                .await;
-            let _ = tx
-                .send(StreamFrame::Done {
-                    stop_reason: Some("stop".into()),
-                    usage: None,
-                })
-                .await;
+        std::thread::spawn(move || {
+            let _ = tx.blocking_send(StreamFrame::Delta {
+                message_id,
+                text: "No model adapter configured.".into(),
+            });
+            let _ = tx.blocking_send(StreamFrame::Done {
+                stop_reason: Some("stop".into()),
+                usage: None,
+            });
         });
         Ok(rx)
     }
