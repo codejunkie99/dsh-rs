@@ -6,7 +6,7 @@ use gpui::{
     Window,
 };
 use harness_core::agent::AgentLoop;
-use harness_core::llm::NullAdapter;
+use harness_core::remote::ModelSelection;
 use harness_core::session::{SessionView, TranscriptEntry};
 use harness_core::store::{SessionStore, SessionSummary};
 use harness_core::tools::{EchoTool, ToolRegistry};
@@ -22,17 +22,31 @@ pub struct Workspace {
     selected_view: Option<SessionView>,
     busy: bool,
     status: SharedString,
+    model: String,
 }
 
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let input = cx.new(crate::input::ChatInput::new);
         let root = Self::sessions_root();
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let selection =
+            ModelSelection::select_from_environment(Some(&home)).unwrap_or_else(|error| {
+                eprintln!("model selection failed: {error}");
+                ModelSelection::select(None, &home.join(".dsh-rs/credentials"), None)
+                    .expect("local fallback adapter")
+            });
         let (store, status) = match SessionStore::open(&root) {
-            Ok(store) => (
-                Arc::new(store),
-                SharedString::from("Ready. Using the built-in local adapter."),
-            ),
+            Ok(store) => {
+                let model_status = if selection.is_remote {
+                    format!("Ready. DeepSeek model {} is connected.", selection.model)
+                } else {
+                    "Ready. Using the built-in local adapter.".to_string()
+                };
+                (Arc::new(store), SharedString::from(model_status))
+            }
             Err(error) => {
                 let fallback = std::env::temp_dir().join("dsh-rs-sessions");
                 let store = SessionStore::open(&fallback).expect("temporary session store");
@@ -48,8 +62,8 @@ impl Workspace {
 
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(EchoTool));
-        let agent = AgentLoop::new(Arc::new(NullAdapter), Arc::new(tools))
-            .with_default_model(Some("local-null".into()))
+        let agent = AgentLoop::new(selection.adapter.clone(), Arc::new(tools))
+            .with_default_model(Some(selection.model.clone()))
             .with_max_steps(8);
 
         let mut workspace = Self {
@@ -61,6 +75,7 @@ impl Workspace {
             selected_view: None,
             busy: false,
             status,
+            model: selection.model.clone(),
         };
         workspace.refresh();
         if workspace.selected.is_none() {
@@ -83,7 +98,7 @@ impl Workspace {
     }
 
     fn create_session(&mut self, cx: &mut Context<Self>) {
-        match self.store.create("New session", Some("local-null".into())) {
+        match self.store.create("New session", Some(self.model.clone())) {
             Ok(log) => {
                 self.selected = Some(log);
                 self.status = SharedString::from("New session created.");
