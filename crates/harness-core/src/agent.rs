@@ -1,5 +1,5 @@
 use crate::events::{EventKind, TurnCompletionReason, Usage};
-use crate::llm::{ChatMessage, LlmAdapter, LlmRequest, StreamFrame};
+use crate::llm::{ChatMessage, LlmAdapter, LlmRequest, StreamFrame, ToolCallRequest};
 use crate::session::SessionLog;
 use crate::tools::{ToolInvocation, ToolRegistry};
 use std::collections::BTreeMap;
@@ -161,7 +161,34 @@ impl AgentLoop {
                 EventKind::AssistantMessage { content, .. } => {
                     messages.push(ChatMessage::Assistant {
                         content: content.clone(),
-                    })
+                    });
+                }
+                EventKind::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    let tool_call = ToolCallRequest {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    };
+                    match messages.last_mut() {
+                        Some(ChatMessage::Assistant { content }) => {
+                            let content = std::mem::take(content);
+                            *messages.last_mut().unwrap() = ChatMessage::AssistantToolCall {
+                                content,
+                                tool_calls: vec![tool_call],
+                            };
+                        }
+                        Some(ChatMessage::AssistantToolCall { tool_calls, .. }) => {
+                            tool_calls.push(tool_call);
+                        }
+                        _ => messages.push(ChatMessage::AssistantToolCall {
+                            content: String::new(),
+                            tool_calls: vec![tool_call],
+                        }),
+                    }
                 }
                 EventKind::ToolResult {
                     call_id, output, ..
@@ -208,5 +235,46 @@ mod tests {
         assert!(kinds.contains(&"user_message"));
         assert!(kinds.contains(&"assistant_message"));
         assert!(kinds.contains(&"turn_completed"));
+    }
+
+    #[test]
+    fn model_history_projects_assistant_tool_calls_before_results() {
+        let log = SessionLog::in_memory(Uuid::new_v4());
+        log.append(EventKind::UserMessage {
+            id: Uuid::new_v4(),
+            content: "use the tool".into(),
+        })
+        .unwrap();
+        log.append(EventKind::AssistantMessage {
+            id: Uuid::new_v4(),
+            content: "I will call the tool.".into(),
+            stop_reason: Some("tool_calls".into()),
+            usage: None,
+        })
+        .unwrap();
+        log.append(EventKind::ToolCall {
+            id: "call_1".into(),
+            name: "echo".into(),
+            arguments: serde_json::json!({"text": "ok"}),
+        })
+        .unwrap();
+        log.append(EventKind::ToolResult {
+            call_id: "call_1".into(),
+            ok: true,
+            output: "ok".into(),
+        })
+        .unwrap();
+
+        let history = AgentLoop::derive_model_history(&log.events());
+        assert_eq!(history.len(), 3);
+        assert!(matches!(
+            history[1],
+            ChatMessage::AssistantToolCall { ref tool_calls, .. }
+                if tool_calls.len() == 1 && tool_calls[0].id == "call_1"
+        ));
+        assert!(matches!(
+            history[2],
+            ChatMessage::Tool { ref tool_call_id, .. } if tool_call_id == "call_1"
+        ));
     }
 }

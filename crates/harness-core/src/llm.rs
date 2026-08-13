@@ -17,10 +17,21 @@ pub enum ChatMessage {
     Assistant {
         content: String,
     },
+    AssistantToolCall {
+        content: String,
+        tool_calls: Vec<ToolCallRequest>,
+    },
     Tool {
         tool_call_id: String,
         content: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCallRequest {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

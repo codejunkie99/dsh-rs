@@ -189,6 +189,29 @@ impl OpenAiCompatibleAdapter {
                 ChatMessage::Assistant { content } => {
                     json!({"role": "assistant", "content": content})
                 }
+                ChatMessage::AssistantToolCall {
+                    content,
+                    tool_calls,
+                } => {
+                    let tool_calls = tool_calls
+                        .iter()
+                        .map(|tool| {
+                            json!({
+                                "id": tool.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool.name,
+                                    "arguments": tool.arguments.to_string(),
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    json!({
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": tool_calls,
+                    })
+                }
                 ChatMessage::Tool {
                     tool_call_id,
                     content,
@@ -532,7 +555,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
 
-    use crate::llm::{ChatMessage, LlmAdapter, LlmRequest, ToolSchema};
+    use crate::llm::{ChatMessage, LlmAdapter, LlmRequest, ToolCallRequest, ToolSchema};
 
     #[test]
     fn credential_store_loads_a_private_file_and_redacts_the_key() {
@@ -596,6 +619,47 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "echo");
         assert_eq!(body["tools"][0]["function"]["description"], "Echo text.");
+    }
+
+    #[test]
+    fn request_body_preserves_assistant_tool_calls_for_tool_results() {
+        let request = LlmRequest {
+            messages: vec![
+                ChatMessage::User {
+                    content: "use the tool".into(),
+                },
+                ChatMessage::AssistantToolCall {
+                    content: "Calling the tool.".into(),
+                    tool_calls: vec![ToolCallRequest {
+                        id: "call_1".into(),
+                        name: "echo".into(),
+                        arguments: json!({"text": "ok"}),
+                    }],
+                },
+                ChatMessage::Tool {
+                    tool_call_id: "call_1".into(),
+                    content: "ok".into(),
+                },
+            ],
+            tools: Vec::new(),
+            model: Some("deepseek-chat".into()),
+            metadata: Default::default(),
+        };
+
+        let body = super::OpenAiCompatibleAdapter::request_body(&request).unwrap();
+        let assistant = &body["messages"][1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["content"], "Calling the tool.");
+        assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
+        assert_eq!(assistant["tool_calls"][0]["type"], "function");
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "echo");
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["arguments"],
+            r#"{"text":"ok"}"#
+        );
+        assert_eq!(body["messages"][2]["role"], "tool");
+        assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+        assert_eq!(body["messages"][2]["content"], "ok");
     }
 
     #[test]
