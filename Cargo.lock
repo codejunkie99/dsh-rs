@@ -1131,6 +1131,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "harness-core",
+ "tokio",
  "unicode-segmentation",
  "uuid",
 ]
