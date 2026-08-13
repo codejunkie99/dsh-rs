@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/harness-core"]
+members = ["crates/harness-core", "crates/dsh-app"]
 
 [workspace.package]
 version = "0.1.0"
