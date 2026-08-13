@@ -8,10 +8,19 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "role")]
 pub enum ChatMessage {
-    System { content: String },
-    User { content: String },
-    Assistant { content: String },
-    Tool { tool_call_id: String, content: String },
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
+    Assistant {
+        content: String,
+    },
+    Tool {
+        tool_call_id: String,
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

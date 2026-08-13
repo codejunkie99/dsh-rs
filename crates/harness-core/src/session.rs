@@ -10,11 +10,27 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "role")]
 pub enum TranscriptEntry {
-    User { id: Uuid, content: String },
-    Assistant { id: Uuid, content: String },
-    ToolCall { id: String, name: String, arguments: serde_json::Value },
-    ToolResult { call_id: String, ok: bool, output: String },
-    System { message: String },
+    User {
+        id: Uuid,
+        content: String,
+    },
+    Assistant {
+        id: Uuid,
+        content: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
+    ToolResult {
+        call_id: String,
+        ok: bool,
+        output: String,
+    },
+    System {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,7 +120,12 @@ impl SessionLog {
 
     pub fn events_after(&self, seq: u64) -> Vec<SessionEvent> {
         let inner = self.inner.read();
-        inner.events.iter().filter(|e| e.seq > seq).cloned().collect()
+        inner
+            .events
+            .iter()
+            .filter(|e| e.seq > seq)
+            .cloned()
+            .collect()
     }
 
     pub fn append(&self, kind: EventKind) -> Result<SessionEvent> {
@@ -146,7 +167,11 @@ impl SessionLog {
                 .first()
                 .map(|e| e.timestamp)
                 .unwrap_or_else(Utc::now),
-            updated_at: inner.events.last().map(|e| e.timestamp).unwrap_or_else(Utc::now),
+            updated_at: inner
+                .events
+                .last()
+                .map(|e| e.timestamp)
+                .unwrap_or_else(Utc::now),
             event_count: inner.events.len() as u64,
             transcript: Self::derive_transcript(&inner.events),
             turn_active: inner.turn_active,
@@ -169,20 +194,24 @@ impl SessionLog {
                         content: content.clone(),
                     })
                 }
-                EventKind::ToolCall { id, name, arguments } => {
-                    out.push(TranscriptEntry::ToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        arguments: arguments.clone(),
-                    })
-                }
-                EventKind::ToolResult { call_id, ok, output } => {
-                    out.push(TranscriptEntry::ToolResult {
-                        call_id: call_id.clone(),
-                        ok: *ok,
-                        output: output.clone(),
-                    })
-                }
+                EventKind::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => out.push(TranscriptEntry::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                }),
+                EventKind::ToolResult {
+                    call_id,
+                    ok,
+                    output,
+                } => out.push(TranscriptEntry::ToolResult {
+                    call_id: call_id.clone(),
+                    ok: *ok,
+                    output: output.clone(),
+                }),
                 EventKind::ErrorNoted { message, .. } => out.push(TranscriptEntry::System {
                     message: message.clone(),
                 }),
@@ -218,7 +247,9 @@ impl SessionLog {
 
     fn replay_from_disk(&self) -> Result<()> {
         let raw = std::fs::read_to_string(
-            self.path.as_ref().context("session path required for replay")?,
+            self.path
+                .as_ref()
+                .context("session path required for replay")?,
         )
         .with_context(|| format!("failed to read session log {:?}", self.path))?;
         let mut inner = self.inner.write();

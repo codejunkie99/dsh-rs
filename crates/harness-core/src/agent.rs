@@ -74,7 +74,11 @@ impl AgentLoop {
                             delta: text,
                         })?;
                     }
-                    StreamFrame::ToolCall { id, name, arguments } => {
+                    StreamFrame::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => {
                         tool_calls.push(crate::events::EventKind::ToolCall {
                             id: id.clone(),
                             name: name.clone(),
@@ -118,7 +122,12 @@ impl AgentLoop {
 
             for call in tool_calls {
                 log.append(call.clone())?;
-                if let EventKind::ToolCall { id, name, arguments } = call {
+                if let EventKind::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } = call
+                {
                     let output = self
                         .tools
                         .execute(ToolInvocation {
@@ -146,11 +155,9 @@ impl AgentLoop {
         let mut messages = Vec::new();
         for event in events {
             match &event.kind {
-                EventKind::UserMessage { content, .. } => {
-                    messages.push(ChatMessage::User {
-                        content: content.clone(),
-                    })
-                }
+                EventKind::UserMessage { content, .. } => messages.push(ChatMessage::User {
+                    content: content.clone(),
+                }),
                 EventKind::AssistantMessage { content, .. } => {
                     messages.push(ChatMessage::Assistant {
                         content: content.clone(),
