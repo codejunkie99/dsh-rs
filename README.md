@@ -13,6 +13,7 @@ A native Rust + GPUI desktop milestone for the DeepSeek Harness agent model. It 
 - Tool registry and echo tool execution path.
 - Read/list filesystem tools confined to `~/.dsh-rs/workspace`; traversal and symlink escapes are rejected.
 - Durable fail-closed approval policy with native GPUI Approve/Deny prompts for `ask` tools.
+- Responsive turn cancellation with a durable cancelled turn event and native Cancel control.
 - Durable session reopening and corrupt-session isolation.
 - Keyboard text editing with clipboard, selection, cursor, and IME hooks.
 - Built-in local null adapter for deterministic, network-free verification.
@@ -89,6 +90,10 @@ The durable policy is stored in `~/.dsh-rs/approvals.json`:
 
 Rules are `allow`, `ask`, or `deny`. Unknown tools fail closed to `deny`. `ask` opens a native Approve/Deny prompt, and every request/resolution is recorded in the session event log. Invalid policy files are not guessed; the app falls back to its fail-closed defaults.
 
+## Cancelling
+
+Press `Cmd+.` or click **Cancel** while a turn is active. Cancellation is checked before model requests and while waiting for model streams. Cancelling also denies a pending tool approval. The session log records the turn with `reason=cancelled`, preserving any assistant chunks already appended before cancellation.
+
 ## Runtime notes
 
 This build uses GPUI's `runtime_shaders` feature so it can build and run with the Command Line Tools renderer path. Full Xcode can precompile GPUI's Metal pipeline, but it is not required for this bundle.
@@ -97,4 +102,4 @@ This build uses GPUI's `runtime_shaders` feature so it can build and run with th
 
 - Remote streaming is implemented, but request retries/rate-limit policy and credential management UI are not implemented yet.
 - The editor is a focused native single-line chat input, not a full multiline code editor.
-- Read/list/write filesystem tools are scoped and enabled, with native approval prompts for write. Shell execution, cancellation controls, and sandbox seams remain future work.
+- Read/list/write filesystem tools are scoped and enabled, with native approval prompts for write. Shell execution and sandbox seams remain future work.
