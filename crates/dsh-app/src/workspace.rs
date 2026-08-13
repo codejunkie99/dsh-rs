@@ -9,6 +9,7 @@ use harness_core::agent::AgentLoop;
 use harness_core::remote::ModelSelection;
 use harness_core::session::{SessionView, TranscriptEntry};
 use harness_core::store::{SessionStore, SessionSummary};
+use harness_core::tools::fs::{ListDirTool, ReadFileTool, ScopedFs};
 use harness_core::tools::{EchoTool, ToolRegistry};
 
 actions!(workspace, [Submit, NewSession]);
@@ -62,6 +63,11 @@ impl Workspace {
 
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(EchoTool));
+        if let Ok(filesystem) = ScopedFs::new(home.join(".dsh-rs").join("workspace")) {
+            let filesystem = Arc::new(filesystem);
+            tools.register(Arc::new(ReadFileTool::new(filesystem.clone())));
+            tools.register(Arc::new(ListDirTool::new(filesystem)));
+        }
         let agent = AgentLoop::new(selection.adapter.clone(), Arc::new(tools))
             .with_default_model(Some(selection.model.clone()))
             .with_max_steps(8);

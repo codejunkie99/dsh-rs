@@ -1,0 +1,418 @@
+use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use crate::tools::{Tool, ToolInvocation, ToolOutput, ToolSpec};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DirEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirEntryInfo {
+    pub name: String,
+    pub kind: DirEntryKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScopedFs {
+    root: PathBuf,
+    max_read_bytes: u64,
+}
+
+impl ScopedFs {
+    pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        std::fs::create_dir_all(root)
+            .with_context(|| format!("failed to create scoped root {}", root.display()))?;
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize scoped root {}", root.display()))?;
+        Ok(Self {
+            root,
+            max_read_bytes: 1024 * 1024,
+        })
+    }
+
+    pub fn with_max_read_bytes(mut self, max_read_bytes: u64) -> Self {
+        self.max_read_bytes = max_read_bytes;
+        self
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn read_text(&self, relative_path: &str) -> Result<String> {
+        let path = self.resolve_existing(relative_path)?;
+        let metadata = std::fs::metadata(&path)
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        if metadata.len() > self.max_read_bytes {
+            bail!(
+                "file {} is {} bytes and exceeds read limit {max} bytes",
+                path.display(),
+                metadata.len(),
+                max = self.max_read_bytes
+            );
+        }
+        std::fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))
+    }
+
+    pub fn write_text(&self, relative_path: &str, contents: &str) -> Result<()> {
+        let path = self.resolve_for_write(relative_path)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("scoped file has no parent directory"))?;
+        let temporary = parent.join(format!(
+            ".dsh-write-{}-{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+
+        let result = (|| -> Result<()> {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+                .with_context(|| {
+                    format!("failed to create temporary file {}", temporary.display())
+                })?;
+            file.write_all(contents.as_bytes()).with_context(|| {
+                format!("failed to write temporary file {}", temporary.display())
+            })?;
+            file.sync_all().with_context(|| {
+                format!("failed to sync temporary file {}", temporary.display())
+            })?;
+            drop(file);
+            std::fs::rename(&temporary, &path)
+                .with_context(|| format!("failed to publish {}", path.display()))?;
+            Ok(())
+        })();
+
+        if result.is_err() && temporary.exists() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    pub fn list_dir(&self, relative_path: &str) -> Result<Vec<DirEntryInfo>> {
+        let path = self.resolve_existing(relative_path)?;
+        if !path.is_dir() {
+            bail!("scoped path is not a directory: {}", path.display());
+        }
+
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&path)
+            .with_context(|| format!("failed to list {}", path.display()))?
+        {
+            let entry = entry.with_context(|| format!("failed to enumerate {}", path.display()))?;
+            let file_type = entry.file_type()?;
+            let kind = if file_type.is_dir() {
+                DirEntryKind::Directory
+            } else if file_type.is_file() {
+                DirEntryKind::File
+            } else if file_type.is_symlink() {
+                DirEntryKind::Symlink
+            } else {
+                DirEntryKind::Other
+            };
+            entries.push(DirEntryInfo {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                kind,
+            });
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(entries)
+    }
+
+    fn lexical_path(&self, relative_path: &str) -> Result<PathBuf> {
+        let input = Path::new(relative_path);
+        if input.is_absolute() {
+            bail!("absolute paths are not allowed in scoped filesystem");
+        }
+
+        let mut path = PathBuf::new();
+        for component in input.components() {
+            match component {
+                Component::Normal(part) => path.push(part),
+                Component::CurDir => {}
+                _ => bail!("path traversal is not allowed in scoped filesystem"),
+            }
+        }
+        Ok(self.root.join(path))
+    }
+
+    fn resolve_existing(&self, relative_path: &str) -> Result<PathBuf> {
+        let lexical = self.lexical_path(relative_path)?;
+        let canonical = lexical.canonicalize().with_context(|| {
+            format!("path does not exist in scoped filesystem: {relative_path}")
+        })?;
+        if !canonical.starts_with(&self.root) {
+            bail!("path resolves outside scoped filesystem root");
+        }
+        Ok(canonical)
+    }
+
+    fn resolve_for_write(&self, relative_path: &str) -> Result<PathBuf> {
+        let lexical = self.lexical_path(relative_path)?;
+        let file_name = lexical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("invalid scoped file path: {relative_path}"))?;
+        if file_name.trim().is_empty() {
+            bail!("scoped file path has no file name");
+        }
+
+        let parent = lexical
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("scoped file path has no parent"))?
+            .canonicalize()
+            .with_context(|| format!("scoped parent does not exist: {relative_path}"))?;
+        if !parent.starts_with(&self.root) {
+            bail!("scoped write parent resolves outside root");
+        }
+
+        let target = parent.join(file_name);
+        if let Ok(metadata) = std::fs::symlink_metadata(&target) {
+            if metadata.file_type().is_symlink() {
+                bail!("symlink writes are not allowed in scoped filesystem");
+            }
+            let canonical = target.canonicalize()?;
+            if !canonical.starts_with(&self.root) {
+                bail!("scoped write resolves outside root");
+            }
+        }
+        Ok(target)
+    }
+}
+
+pub struct ReadFileTool {
+    fs: Arc<ScopedFs>,
+}
+
+impl ReadFileTool {
+    pub fn new(fs: Arc<ScopedFs>) -> Self {
+        Self { fs }
+    }
+}
+
+#[async_trait]
+impl Tool for ReadFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "read_file".into(),
+            description: "Read a UTF-8 text file from the scoped workspace.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Workspace-relative path"}
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+
+    async fn execute(&self, invocation: ToolInvocation) -> Result<ToolOutput> {
+        let path = required_string(&invocation.arguments, "path")?;
+        Ok(ToolOutput {
+            ok: true,
+            output: self.fs.read_text(&path)?,
+        })
+    }
+}
+
+pub struct WriteFileTool {
+    fs: Arc<ScopedFs>,
+}
+
+impl WriteFileTool {
+    pub fn new(fs: Arc<ScopedFs>) -> Self {
+        Self { fs }
+    }
+}
+
+#[async_trait]
+impl Tool for WriteFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "write_file".into(),
+            description: "Atomically write a UTF-8 text file inside the scoped workspace.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Workspace-relative path"},
+                    "content": {"type": "string", "description": "Full file contents"}
+                },
+                "required": ["path", "content"]
+            }),
+        }
+    }
+
+    async fn execute(&self, invocation: ToolInvocation) -> Result<ToolOutput> {
+        let path = required_string(&invocation.arguments, "path")?;
+        let content = required_string(&invocation.arguments, "content")?;
+        self.fs.write_text(&path, &content)?;
+        Ok(ToolOutput {
+            ok: true,
+            output: format!("Wrote {path} ({} bytes).", content.len()),
+        })
+    }
+}
+
+pub struct ListDirTool {
+    fs: Arc<ScopedFs>,
+}
+
+impl ListDirTool {
+    pub fn new(fs: Arc<ScopedFs>) -> Self {
+        Self { fs }
+    }
+}
+
+#[async_trait]
+impl Tool for ListDirTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "list_dir".into(),
+            description: "List immediate entries in a scoped workspace directory.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Workspace-relative directory"}
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+
+    async fn execute(&self, invocation: ToolInvocation) -> Result<ToolOutput> {
+        let path = required_string(&invocation.arguments, "path")?;
+        let entries = self.fs.list_dir(&path)?;
+        Ok(ToolOutput {
+            ok: true,
+            output: serde_json::to_string(&entries)?,
+        })
+    }
+}
+
+fn required_string(arguments: &serde_json::Value, key: &str) -> Result<String> {
+    arguments
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .with_context(|| format!("tool argument {key} must be a string"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::{Tool, ToolInvocation};
+
+    #[test]
+    fn scoped_fs_confines_reads_to_its_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("notes")).unwrap();
+        std::fs::write(root.path().join("notes/hello.txt"), "hello").unwrap();
+
+        let fs = ScopedFs::new(root.path()).unwrap();
+        assert_eq!(fs.read_text("notes/hello.txt").unwrap(), "hello");
+        assert!(fs.read_text("../hello.txt").is_err());
+        assert!(fs.read_text("/etc/hosts").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_fs_rejects_symlink_escapes() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("escape.txt"),
+        )
+        .unwrap();
+
+        let fs = ScopedFs::new(root.path()).unwrap();
+        assert!(fs.read_text("escape.txt").is_err());
+    }
+
+    #[test]
+    fn scoped_fs_writes_atomically_and_lists_sorted_entries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("workspace")).unwrap();
+        let fs = ScopedFs::new(root.path()).unwrap();
+        fs.write_text("workspace/b.txt", "b").unwrap();
+        fs.write_text("workspace/a.txt", "a").unwrap();
+
+        assert_eq!(fs.read_text("workspace/a.txt").unwrap(), "a");
+        let entries = fs.list_dir("workspace").unwrap();
+        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["a.txt", "b.txt"]);
+        assert!(entries.iter().all(|entry| entry.kind == DirEntryKind::File));
+    }
+
+    #[test]
+    fn scoped_fs_enforces_read_limits() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("large.txt"), "123456789").unwrap();
+        let fs = ScopedFs::new(root.path()).unwrap().with_max_read_bytes(8);
+        let error = fs.read_text("large.txt").unwrap_err();
+        assert!(error.to_string().contains("exceeds read limit"));
+    }
+
+    #[tokio::test]
+    async fn filesystem_tools_execute_model_requests() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("workspace")).unwrap();
+        let fs = std::sync::Arc::new(ScopedFs::new(root.path()).unwrap());
+
+        let write = WriteFileTool::new(fs.clone());
+        assert_eq!(write.spec().name, "write_file");
+        let output = write
+            .execute(ToolInvocation {
+                call_id: "call_write".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({
+                    "path": "workspace/hello.txt",
+                    "content": "hello"
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(output.ok);
+        assert!(output.output.contains("workspace/hello.txt"));
+
+        let read = ReadFileTool::new(fs.clone());
+        assert_eq!(read.spec().name, "read_file");
+        let output = read
+            .execute(ToolInvocation {
+                call_id: "call_read".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "workspace/hello.txt"}),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.output, "hello");
+
+        let list = ListDirTool::new(fs);
+        assert_eq!(list.spec().name, "list_dir");
+        let output = list
+            .execute(ToolInvocation {
+                call_id: "call_list".into(),
+                name: "list_dir".into(),
+                arguments: serde_json::json!({"path": "workspace"}),
+            })
+            .await
+            .unwrap();
+        assert!(output.output.contains("hello.txt"));
+        assert!(output.output.contains("file"));
+    }
+}
