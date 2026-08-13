@@ -8,7 +8,7 @@ use gpui::{
 use input::{
     Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft, SelectRight,
 };
-use workspace::{NewSession, Submit, Workspace};
+use workspace::{CancelTurn, NewSession, Submit, Workspace};
 
 const APP_TITLE: &str = "DeepSeek Harness RS";
 actions!(dsh_app, [Quit]);
@@ -18,6 +18,7 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("enter", Submit, Some("ChatInput")),
             KeyBinding::new("cmd-n", NewSession, Some("Workspace")),
+            KeyBinding::new("cmd-.", CancelTurn, Some("Workspace")),
             KeyBinding::new("backspace", Backspace, Some("ChatInput")),
             KeyBinding::new("delete", Delete, Some("ChatInput")),
             KeyBinding::new("left", Left, Some("ChatInput")),

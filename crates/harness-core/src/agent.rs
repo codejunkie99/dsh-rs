@@ -1,4 +1,5 @@
 use crate::approval::{ApprovalDecision, ApprovalPolicy, PolicyApprover, ToolApprover};
+use crate::cancellation::TurnCancellation;
 use crate::events::{EventKind, TurnCompletionReason, Usage};
 use crate::llm::{ChatMessage, LlmAdapter, LlmRequest, StreamFrame, ToolCallRequest};
 use crate::session::SessionLog;
@@ -14,6 +15,12 @@ pub struct AgentLoop {
     approver: Arc<dyn ToolApprover>,
     default_model: Option<String>,
     max_steps: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Completed,
+    Cancelled,
 }
 
 impl AgentLoop {
@@ -44,7 +51,21 @@ impl AgentLoop {
 
     /// Runs one complete turn: one user input, zero or more model steps,
     /// and tool calls until the model stops or the step budget is exhausted.
-    pub async fn run_turn(&self, log: Arc<SessionLog>, input: String) -> anyhow::Result<()> {
+    pub async fn run_turn(
+        &self,
+        log: Arc<SessionLog>,
+        input: String,
+    ) -> anyhow::Result<TurnOutcome> {
+        self.run_turn_with_cancellation(log, input, TurnCancellation::new())
+            .await
+    }
+
+    pub async fn run_turn_with_cancellation(
+        &self,
+        log: Arc<SessionLog>,
+        input: String,
+        cancellation: TurnCancellation,
+    ) -> anyhow::Result<TurnOutcome> {
         log.append(EventKind::TurnStarted)?;
         log.append(EventKind::UserMessage {
             id: Uuid::new_v4(),
@@ -53,7 +74,18 @@ impl AgentLoop {
 
         let mut completion = TurnCompletionReason::Natural;
 
+        if cancellation.is_cancelled() {
+            log.append(EventKind::TurnCompleted {
+                reason: TurnCompletionReason::Cancelled,
+            })?;
+            return Ok(TurnOutcome::Cancelled);
+        }
+
         for step in 0..self.max_steps {
+            if cancellation.is_cancelled() {
+                completion = TurnCompletionReason::Cancelled;
+                break;
+            }
             log.append(EventKind::StepStarted { index: step })?;
 
             let history = Self::derive_model_history(&log.events());
@@ -72,39 +104,59 @@ impl AgentLoop {
             let mut tool_calls = Vec::new();
             let mut stream_error: Option<String> = None;
 
-            while let Some(frame) = stream.recv().await {
-                match frame {
-                    StreamFrame::Delta { message_id, text } => {
-                        assistant_id = message_id;
-                        assistant_text.push_str(&text);
-                        log.append(EventKind::AssistantChunk {
-                            message_id,
-                            delta: text,
-                        })?;
+            let mut cancellation_receiver = cancellation.receiver();
+            let mut cancelled = false;
+            loop {
+                tokio::select! {
+                    changed = cancellation_receiver.changed() => {
+                        if changed.is_ok() && cancellation.is_cancelled() {
+                            cancelled = true;
+                            break;
+                        }
                     }
-                    StreamFrame::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    } => {
-                        tool_calls.push(crate::events::EventKind::ToolCall {
-                            id: id.clone(),
-                            name: name.clone(),
-                            arguments: arguments.clone(),
-                        });
-                    }
-                    StreamFrame::Done {
-                        stop_reason: reason,
-                        usage: token_usage,
-                    } => {
-                        stop_reason = reason;
-                        usage = token_usage;
-                    }
-                    StreamFrame::Error { message } => {
-                        stream_error = Some(message);
-                        break;
+                    frame = stream.recv() => {
+                        let Some(frame) = frame else {
+                            break;
+                        };
+                        match frame {
+                            StreamFrame::Delta { message_id, text } => {
+                                assistant_id = message_id;
+                                assistant_text.push_str(&text);
+                                log.append(EventKind::AssistantChunk {
+                                    message_id,
+                                    delta: text,
+                                })?;
+                            }
+                            StreamFrame::ToolCall {
+                                id,
+                                name,
+                                arguments,
+                            } => {
+                                tool_calls.push(crate::events::EventKind::ToolCall {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    arguments: arguments.clone(),
+                                });
+                            }
+                            StreamFrame::Done {
+                                stop_reason: reason,
+                                usage: token_usage,
+                            } => {
+                                stop_reason = reason;
+                                usage = token_usage;
+                            }
+                            StreamFrame::Error { message } => {
+                                stream_error = Some(message);
+                                break;
+                            }
+                        }
                     }
                 }
+            }
+
+            if cancelled {
+                completion = TurnCompletionReason::Cancelled;
+                break;
             }
 
             if let Some(message) = stream_error {
@@ -129,6 +181,10 @@ impl AgentLoop {
             }
 
             for call in tool_calls {
+                if cancellation.is_cancelled() {
+                    completion = TurnCompletionReason::Cancelled;
+                    break;
+                }
                 log.append(call.clone())?;
                 if let EventKind::ToolCall {
                     id,
@@ -149,10 +205,19 @@ impl AgentLoop {
             }
 
             log.append(EventKind::StepCompleted)?;
+
+            if completion == TurnCompletionReason::Cancelled {
+                break;
+            }
         }
 
+        let was_cancelled = completion == TurnCompletionReason::Cancelled;
         log.append(EventKind::TurnCompleted { reason: completion })?;
-        Ok(())
+        Ok(if was_cancelled {
+            TurnOutcome::Cancelled
+        } else {
+            TurnOutcome::Completed
+        })
     }
 
     async fn execute_tool(

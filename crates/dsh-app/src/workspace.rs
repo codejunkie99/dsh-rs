@@ -7,13 +7,14 @@ use gpui::{
 };
 use harness_core::agent::AgentLoop;
 use harness_core::approval::{ApprovalPolicy, ApprovalRequest, ChannelApprover, GatedApprover};
+use harness_core::cancellation::TurnCancellation;
 use harness_core::remote::ModelSelection;
 use harness_core::session::{SessionView, TranscriptEntry};
 use harness_core::store::{SessionStore, SessionSummary};
 use harness_core::tools::fs::{ListDirTool, ReadFileTool, ScopedFs, WriteFileTool};
 use harness_core::tools::{EchoTool, ToolRegistry};
 
-actions!(workspace, [Submit, NewSession]);
+actions!(workspace, [Submit, NewSession, CancelTurn]);
 
 pub struct Workspace {
     store: Arc<SessionStore>,
@@ -26,6 +27,7 @@ pub struct Workspace {
     status: SharedString,
     model: String,
     pending_approval: Option<ApprovalRequest>,
+    cancellation: Option<TurnCancellation>,
 }
 
 impl Workspace {
@@ -100,6 +102,7 @@ impl Workspace {
             status,
             model: selection.model.clone(),
             pending_approval: None,
+            cancellation: None,
         };
         let workspace_handle = cx.entity();
         cx.spawn(async move |_, cx| {
@@ -187,22 +190,35 @@ impl Workspace {
         }
 
         self.busy = true;
+        let cancellation = TurnCancellation::new();
+        self.cancellation = Some(cancellation.clone());
         self.status = SharedString::from("Turn running...");
         self.input.update(cx, |input, cx| input.clear(cx));
         cx.notify();
 
         let agent = self.agent.clone();
+        let cancellation_for_turn = cancellation;
         let workspace = cx.entity();
         cx.spawn(async move |_, cx| {
             let result = cx
-                .background_spawn(async move { agent.run_turn(log, text).await })
+                .background_spawn(async move {
+                    agent
+                        .run_turn_with_cancellation(log, text, cancellation_for_turn)
+                        .await
+                })
                 .await;
             let _ = cx.update(|cx| {
                 workspace.update(cx, |workspace, cx| {
                     workspace.busy = false;
+                    workspace.cancellation = None;
                     workspace.refresh();
                     workspace.status = match result {
-                        Ok(()) => SharedString::from("Turn complete."),
+                        Ok(harness_core::agent::TurnOutcome::Completed) => {
+                            SharedString::from("Turn complete.")
+                        }
+                        Ok(harness_core::agent::TurnOutcome::Cancelled) => {
+                            SharedString::from("Turn cancelled.")
+                        }
                         Err(error) => SharedString::from(format!("Turn failed: {error}")),
                     };
                     cx.notify();
@@ -210,6 +226,17 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    fn cancel_turn(&mut self, _: &CancelTurn, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+            self.status = SharedString::from("Cancelling turn...");
+        }
+        if let Some(request) = self.pending_approval.take() {
+            let _ = request.responder.send(false);
+        }
+        cx.notify();
     }
 
     fn resolve_approval(&mut self, approved: bool, cx: &mut Context<Self>) {
@@ -248,6 +275,26 @@ impl Workspace {
                             .text_color(rgb(0x8f9aa8))
                             .child("SESSIONS"),
                     )
+                    .children(self.busy.then(|| {
+                        div()
+                            .id("cancel-turn")
+                            .px_4()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .bg(rgb(0x753030))
+                            .text_size(px(13.))
+                            .text_color(rgb(0xffe8e8))
+                            .hover(|style| style.bg(rgb(0x8e3a3a)).cursor_pointer())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, window, cx| {
+                                    workspace.cancel_turn(&CancelTurn, window, cx)
+                                }),
+                            )
+                            .child("Cancel")
+                    }))
                     .child(
                         div()
                             .id("new-session")
@@ -458,6 +505,7 @@ impl Render for Workspace {
             .text_color(rgb(0xe7e9ee))
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(|workspace, _: &NewSession, _, cx| workspace.create_session(cx)))
+            .on_action(cx.listener(Self::cancel_turn))
             .child(self.render_sidebar(cx))
             .child(
                 div()
