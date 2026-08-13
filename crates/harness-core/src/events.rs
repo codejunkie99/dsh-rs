@@ -36,6 +36,16 @@ pub enum EventKind {
         name: String,
         arguments: serde_json::Value,
     },
+    ApprovalRequested {
+        call_id: String,
+        tool_name: String,
+        arguments: serde_json::Value,
+    },
+    ApprovalResolved {
+        call_id: String,
+        approved: bool,
+        reason: String,
+    },
     ToolResult {
         call_id: String,
         ok: bool,

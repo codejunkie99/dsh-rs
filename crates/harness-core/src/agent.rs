@@ -1,3 +1,4 @@
+use crate::approval::{ApprovalDecision, ApprovalPolicy, PolicyApprover, ToolApprover};
 use crate::events::{EventKind, TurnCompletionReason, Usage};
 use crate::llm::{ChatMessage, LlmAdapter, LlmRequest, StreamFrame, ToolCallRequest};
 use crate::session::SessionLog;
@@ -10,6 +11,7 @@ use uuid::Uuid;
 pub struct AgentLoop {
     llm: Arc<dyn LlmAdapter>,
     tools: Arc<ToolRegistry>,
+    approver: Arc<dyn ToolApprover>,
     default_model: Option<String>,
     max_steps: u64,
 }
@@ -19,6 +21,7 @@ impl AgentLoop {
         Self {
             llm,
             tools,
+            approver: Arc::new(PolicyApprover::new(ApprovalPolicy::default())),
             default_model: None,
             max_steps: 24,
         }
@@ -31,6 +34,11 @@ impl AgentLoop {
 
     pub fn with_max_steps(mut self, max_steps: u64) -> Self {
         self.max_steps = max_steps;
+        self
+    }
+
+    pub fn with_approver(mut self, approver: Arc<dyn ToolApprover>) -> Self {
+        self.approver = approver;
         self
     }
 
@@ -128,19 +136,15 @@ impl AgentLoop {
                     arguments,
                 } = call
                 {
-                    let output = self
-                        .tools
-                        .execute(ToolInvocation {
-                            call_id: id.clone(),
+                    self.execute_tool(
+                        log.clone(),
+                        ToolInvocation {
+                            call_id: id,
                             name,
                             arguments,
-                        })
-                        .await;
-                    log.append(EventKind::ToolResult {
-                        call_id: id,
-                        ok: output.ok,
-                        output: output.output,
-                    })?;
+                        },
+                    )
+                    .await?;
                 }
             }
 
@@ -148,6 +152,51 @@ impl AgentLoop {
         }
 
         log.append(EventKind::TurnCompleted { reason: completion })?;
+        Ok(())
+    }
+
+    async fn execute_tool(
+        &self,
+        log: Arc<SessionLog>,
+        invocation: ToolInvocation,
+    ) -> anyhow::Result<()> {
+        log.append(EventKind::ApprovalRequested {
+            call_id: invocation.call_id.clone(),
+            tool_name: invocation.name.clone(),
+            arguments: invocation.arguments.clone(),
+        })?;
+        let decision = self
+            .approver
+            .decide(&invocation.call_id, &invocation.name, &invocation.arguments)
+            .await;
+        let (approved, reason): (bool, String) = match decision {
+            ApprovalDecision::Allow => (true, "allowed by approval policy".into()),
+            ApprovalDecision::Ask => (
+                false,
+                "tool requires explicit approval; no approval was provided".into(),
+            ),
+            ApprovalDecision::Deny => (false, "denied by approval policy".into()),
+        };
+        log.append(EventKind::ApprovalResolved {
+            call_id: invocation.call_id.clone(),
+            approved,
+            reason: reason.clone(),
+        })?;
+
+        let call_id = invocation.call_id.clone();
+        let output = if approved {
+            self.tools.execute(invocation).await
+        } else {
+            crate::tools::ToolOutput {
+                ok: false,
+                output: reason,
+            }
+        };
+        log.append(EventKind::ToolResult {
+            call_id,
+            ok: output.ok,
+            output: output.output,
+        })?;
         Ok(())
     }
 
@@ -206,8 +255,10 @@ impl AgentLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::{ApprovalPolicy, ApprovalRule, PolicyApprover};
     use crate::llm::NullAdapter;
     use crate::tools::EchoTool;
+    use crate::tools::ToolInvocation;
 
     #[tokio::test]
     async fn null_adapter_completes_one_turn() {
@@ -276,5 +327,45 @@ mod tests {
             history[2],
             ChatMessage::Tool { ref tool_call_id, .. } if tool_call_id == "call_1"
         ));
+    }
+
+    #[tokio::test]
+    async fn unresolved_approval_requests_are_recorded_and_fail_closed() {
+        let log = Arc::new(SessionLog::in_memory(Uuid::new_v4()));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        let mut policy = ApprovalPolicy::default();
+        policy.tools.insert("echo".into(), ApprovalRule::Ask);
+        let agent = AgentLoop::new(Arc::new(NullAdapter), Arc::new(tools))
+            .with_approver(Arc::new(PolicyApprover::new(policy)));
+
+        agent
+            .execute_tool(
+                log.clone(),
+                ToolInvocation {
+                    call_id: "call_approval".into(),
+                    name: "echo".into(),
+                    arguments: serde_json::json!({"text": "sensitive"}),
+                },
+            )
+            .await
+            .unwrap();
+
+        let events = log.events();
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::ApprovalRequested { call_id, tool_name, .. }
+                if call_id == "call_approval" && tool_name == "echo"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::ApprovalResolved { call_id, approved, .. }
+                if call_id == "call_approval" && !approved
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::ToolResult { call_id, ok, output }
+                if call_id == "call_approval" && !ok && output.contains("requires explicit approval")
+        )));
     }
 }

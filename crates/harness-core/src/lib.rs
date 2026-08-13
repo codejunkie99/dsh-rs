@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod approval;
 pub mod events;
 pub mod llm;
 pub mod remote;

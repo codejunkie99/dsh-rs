@@ -9,3 +9,4 @@ gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "r
 harness-core = { path = "../harness-core" }
 unicode-segmentation = "1"
 uuid.workspace = true
+tokio.workspace = true

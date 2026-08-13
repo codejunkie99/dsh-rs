@@ -6,10 +6,11 @@ use gpui::{
     Window,
 };
 use harness_core::agent::AgentLoop;
+use harness_core::approval::{ApprovalPolicy, ApprovalRequest, ChannelApprover, GatedApprover};
 use harness_core::remote::ModelSelection;
 use harness_core::session::{SessionView, TranscriptEntry};
 use harness_core::store::{SessionStore, SessionSummary};
-use harness_core::tools::fs::{ListDirTool, ReadFileTool, ScopedFs};
+use harness_core::tools::fs::{ListDirTool, ReadFileTool, ScopedFs, WriteFileTool};
 use harness_core::tools::{EchoTool, ToolRegistry};
 
 actions!(workspace, [Submit, NewSession]);
@@ -24,6 +25,7 @@ pub struct Workspace {
     busy: bool,
     status: SharedString,
     model: String,
+    pending_approval: Option<ApprovalRequest>,
 }
 
 impl Workspace {
@@ -39,6 +41,19 @@ impl Workspace {
                 ModelSelection::select(None, &home.join(".dsh-rs/credentials"), None)
                     .expect("local fallback adapter")
             });
+        let approval_path = home.join(".dsh-rs").join("approvals.json");
+        if !approval_path.exists() {
+            let _ = ApprovalPolicy::default().save(&approval_path);
+        }
+        let approval_policy = match ApprovalPolicy::load(&approval_path) {
+            Ok(policy) => policy,
+            Err(error) => {
+                eprintln!("approval policy load failed ({error}); using fail-closed defaults");
+                ApprovalPolicy::default()
+            }
+        };
+        let (approval_channel, mut approval_requests) = ChannelApprover::channel();
+        let approver = Arc::new(GatedApprover::new(approval_policy, approval_channel));
         let (store, status) = match SessionStore::open(&root) {
             Ok(store) => {
                 let model_status = if selection.is_remote {
@@ -66,10 +81,12 @@ impl Workspace {
         if let Ok(filesystem) = ScopedFs::new(home.join(".dsh-rs").join("workspace")) {
             let filesystem = Arc::new(filesystem);
             tools.register(Arc::new(ReadFileTool::new(filesystem.clone())));
-            tools.register(Arc::new(ListDirTool::new(filesystem)));
+            tools.register(Arc::new(ListDirTool::new(filesystem.clone())));
+            tools.register(Arc::new(WriteFileTool::new(filesystem)));
         }
         let agent = AgentLoop::new(selection.adapter.clone(), Arc::new(tools))
             .with_default_model(Some(selection.model.clone()))
+            .with_approver(approver)
             .with_max_steps(8);
 
         let mut workspace = Self {
@@ -82,7 +99,30 @@ impl Workspace {
             busy: false,
             status,
             model: selection.model.clone(),
+            pending_approval: None,
         };
+        let workspace_handle = cx.entity();
+        cx.spawn(async move |_, cx| {
+            while let Some(request) = approval_requests.recv().await {
+                if cx
+                    .update(|cx| {
+                        workspace_handle.update(cx, |workspace, cx| {
+                            workspace.pending_approval = Some(request);
+                            workspace.status = SharedString::from(format!(
+                                "Approval required for {} ({})",
+                                workspace.pending_approval.as_ref().unwrap().tool_name,
+                                workspace.pending_approval.as_ref().unwrap().call_id
+                            ));
+                            cx.notify();
+                        });
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         workspace.refresh();
         if workspace.selected.is_none() {
             workspace.create_session(cx);
@@ -170,6 +210,19 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    fn resolve_approval(&mut self, approved: bool, cx: &mut Context<Self>) {
+        if let Some(request) = self.pending_approval.take() {
+            let tool_name = request.tool_name.clone();
+            let call_id = request.call_id.clone();
+            let _ = request.responder.send(approved);
+            self.status = SharedString::from(format!(
+                "Approval {call_id} for {tool_name} {}",
+                if approved { "granted" } else { "denied" }
+            ));
+        }
+        cx.notify();
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -305,6 +358,93 @@ impl Workspace {
                     )
             }))
     }
+
+    fn render_approval(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (tool_name, call_id, arguments) = self
+            .pending_approval
+            .as_ref()
+            .map(|request| {
+                (
+                    request.tool_name.clone(),
+                    request.call_id.clone(),
+                    request.arguments.to_string(),
+                )
+            })
+            .unwrap_or_default();
+
+        div()
+            .id("approval")
+            .mx_6()
+            .my_3()
+            .px_4()
+            .py_3()
+            .rounded_md()
+            .bg(rgb(0x2b2114))
+            .border_1()
+            .border_color(rgb(0x6f5220))
+            .flex()
+            .justify_between()
+            .gap_3()
+            .child(
+                div()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0xffd9a0))
+                            .child(format!("Approve {tool_name}?")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(0xa89168))
+                            .child(format!("{call_id} {arguments}")),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("approve-tool")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x246b53))
+                            .text_size(px(12.))
+                            .text_color(rgb(0xe8fff6))
+                            .hover(|style| style.bg(rgb(0x2d8465)).cursor_pointer())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, _, cx| {
+                                    workspace.resolve_approval(true, cx)
+                                }),
+                            )
+                            .child("Approve"),
+                    )
+                    .child(
+                        div()
+                            .id("deny-tool")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x753030))
+                            .text_size(px(12.))
+                            .text_color(rgb(0xffe8e8))
+                            .hover(|style| style.bg(rgb(0x8e3a3a)).cursor_pointer())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, _, cx| {
+                                    workspace.resolve_approval(false, cx)
+                                }),
+                            )
+                            .child("Deny"),
+                    ),
+            )
+    }
 }
 
 impl Render for Workspace {
@@ -326,6 +466,11 @@ impl Render for Workspace {
                     .flex()
                     .flex_col()
                     .child(self.render_transcript())
+                    .children(
+                        self.pending_approval
+                            .as_ref()
+                            .map(|_| self.render_approval(cx)),
+                    )
                     .child(
                         div()
                             .px_6()

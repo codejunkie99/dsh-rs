@@ -203,6 +203,21 @@ impl SessionLog {
                     name: name.clone(),
                     arguments: arguments.clone(),
                 }),
+                EventKind::ApprovalRequested {
+                    call_id, tool_name, ..
+                } => out.push(TranscriptEntry::System {
+                    message: format!("Approval requested for {tool_name} ({call_id})"),
+                }),
+                EventKind::ApprovalResolved {
+                    call_id,
+                    approved,
+                    reason,
+                } => out.push(TranscriptEntry::System {
+                    message: format!(
+                        "Approval {call_id} {}: {reason}",
+                        if *approved { "approved" } else { "denied" }
+                    ),
+                }),
                 EventKind::ToolResult {
                     call_id,
                     ok,
