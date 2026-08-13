@@ -1,4 +1,5 @@
 pub mod fs;
+pub mod shell;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

@@ -141,6 +141,7 @@ impl Default for ApprovalPolicy {
                 ("read_file".into(), ApprovalRule::Allow),
                 ("list_dir".into(), ApprovalRule::Allow),
                 ("write_file".into(), ApprovalRule::Ask),
+                ("run_command".into(), ApprovalRule::Ask),
             ]),
         }
     }
@@ -204,7 +205,8 @@ mod tests {
               "tools": {
                 "read_file": "allow",
                 "list_dir": "allow",
-                "write_file": "ask"
+                "write_file": "ask",
+                "run_command": "ask"
               }
             }"#,
         )
@@ -213,6 +215,7 @@ mod tests {
         assert_eq!(policy.decide("read_file"), ApprovalDecision::Allow);
         assert_eq!(policy.decide("list_dir"), ApprovalDecision::Allow);
         assert_eq!(policy.decide("write_file"), ApprovalDecision::Ask);
+        assert_eq!(policy.decide("run_command"), ApprovalDecision::Ask);
         assert_eq!(policy.decide("shell"), ApprovalDecision::Deny);
     }
 
