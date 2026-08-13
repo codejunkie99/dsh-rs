@@ -12,6 +12,7 @@ use harness_core::remote::ModelSelection;
 use harness_core::session::{SessionView, TranscriptEntry};
 use harness_core::store::{SessionStore, SessionSummary};
 use harness_core::tools::fs::{ListDirTool, ReadFileTool, ScopedFs, WriteFileTool};
+use harness_core::tools::shell::{CommandTool, ShellPolicy};
 use harness_core::tools::{EchoTool, ToolRegistry};
 
 actions!(workspace, [Submit, NewSession, CancelTurn]);
@@ -84,7 +85,22 @@ impl Workspace {
             let filesystem = Arc::new(filesystem);
             tools.register(Arc::new(ReadFileTool::new(filesystem.clone())));
             tools.register(Arc::new(ListDirTool::new(filesystem.clone())));
-            tools.register(Arc::new(WriteFileTool::new(filesystem)));
+            tools.register(Arc::new(WriteFileTool::new(filesystem.clone())));
+
+            let shell_path = home.join(".dsh-rs").join("shell.json");
+            if !shell_path.exists() {
+                let _ = ShellPolicy::default()
+                    .canonicalize()
+                    .unwrap()
+                    .save(&shell_path);
+            }
+            match ShellPolicy::load(&shell_path) {
+                Ok(shell_policy) if !shell_policy.allowed_binaries.is_empty() => {
+                    tools.register(Arc::new(CommandTool::new(filesystem, shell_policy)));
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("shell policy load failed ({error}); shell stays disabled"),
+            }
         }
         let agent = AgentLoop::new(selection.adapter.clone(), Arc::new(tools))
             .with_default_model(Some(selection.model.clone()))
