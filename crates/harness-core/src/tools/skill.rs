@@ -1,3 +1,4 @@
+pub use crate::skills::SkillCatalogEntry;
 use crate::skills::{is_skill_name, render_skill_content, SkillLookupOptions, SkillRegistry};
 use crate::tools::{Tool, ToolInvocation, ToolOutput, ToolSpec};
 use anyhow::{bail, Result};
@@ -11,6 +12,8 @@ pub struct SkillTool {
     cwd: Option<PathBuf>,
 }
 
+pub const CATALOG_DESCRIPTION_MAX_LENGTH: usize = 500;
+
 impl SkillTool {
     pub fn new(skills: Arc<SkillRegistry>) -> Self {
         Self { skills, cwd: None }
@@ -20,11 +23,91 @@ impl SkillTool {
         self.cwd = Some(cwd.into());
         self
     }
+
+    pub async fn catalog_entries(&self) -> Result<Vec<SkillCatalogEntry>> {
+        let options = SkillLookupOptions {
+            cwd: self.cwd.clone(),
+        };
+        Ok(self
+            .skills
+            .list(&options)
+            .await?
+            .into_iter()
+            .filter(|skill| skill.invocation.model_invocable)
+            .map(|skill| SkillCatalogEntry {
+                name: skill.name,
+                description: catalog_description(&skill.description),
+            })
+            .collect())
+    }
+
+    pub async fn invoke_user(&self, name: &str) -> Result<Option<String>> {
+        let options = SkillLookupOptions {
+            cwd: self.cwd.clone(),
+        };
+        let Some(skill) = self.skills.get(name, &options).await? else {
+            return Ok(None);
+        };
+        if !skill.invocation.user_invocable {
+            return Ok(None);
+        }
+        Ok(Some(render_skill_content(
+            &skill.name,
+            &skill.provider,
+            skill.resource_base,
+            &skill.content,
+        )))
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct SkillArguments {
     name: String,
+}
+
+pub fn render_skill_catalog(entries: &[SkillCatalogEntry]) -> String {
+    let mut lines = vec![
+        "<system-reminder>".to_string(),
+        "A skill is a reusable set of task-specific instructions. The following skills are available in this session:".to_string(),
+        String::new(),
+        "<available_skills>".to_string(),
+    ];
+    lines.extend(entries.iter().map(|entry| {
+        format!(
+            "- `{}`: {}",
+            entry.name,
+            escape_catalog_text(&entry.description)
+        )
+    }));
+    lines.extend([
+        "</available_skills>".to_string(),
+        String::new(),
+        "If the user names a skill, or the task clearly matches a skill's description, call the `skill` tool with the exact skill name before taking task actions. Load all applicable skills, then follow their full instructions. This catalog contains summaries only; do not infer or follow a skill's instructions until it has been loaded.".to_string(),
+        "A user may also invoke a skill directly; its <skill_content> block then appears in this conversation. Follow it, and do not call the `skill` tool again for that skill.".to_string(),
+        "</system-reminder>".to_string(),
+    ]);
+    lines.join("\n")
+}
+
+fn catalog_description(value: &str) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= CATALOG_DESCRIPTION_MAX_LENGTH {
+        return normalized;
+    }
+    format!(
+        "{}...",
+        normalized
+            .chars()
+            .take(CATALOG_DESCRIPTION_MAX_LENGTH - 3)
+            .collect::<String>()
+    )
+}
+
+fn escape_catalog_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[async_trait]

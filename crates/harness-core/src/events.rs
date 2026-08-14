@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use uuid::Uuid;
 
+use crate::skills::SkillCatalogEntry;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
@@ -63,6 +65,14 @@ pub enum EventKind {
     },
     UserMessage {
         id: Uuid,
+        content: String,
+    },
+    SkillCatalogPublished {
+        entries: Vec<SkillCatalogEntry>,
+        content: String,
+    },
+    SkillInvocationInjected {
+        name: String,
         content: String,
     },
     AssistantChunk {

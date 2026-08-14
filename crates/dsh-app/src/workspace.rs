@@ -189,6 +189,7 @@ pub struct Workspace {
     credential_environment_override: bool,
     credential_file_configured: bool,
     tools: Arc<ToolRegistry>,
+    skill_tool: Option<Arc<SkillTool>>,
     terminal_tool: Option<Arc<CommandTool>>,
     approver: Arc<dyn ToolApprover>,
     changes: WorkspaceChangesState,
@@ -543,13 +544,18 @@ impl Workspace {
             status
         };
 
-        let tools = Self::build_tools(&home, &workspace_root, &selected_harness);
+        let (tools, skill_tool) =
+            Self::build_tools_with_skills(&home, &workspace_root, &selected_harness);
         let terminal_tool = Self::build_terminal_tool(&home, &workspace_root);
         let agent = AgentLoop::new(selection.adapter.clone(), tools.clone())
             .with_default_model(Some(selection.model.clone()))
             .with_system_prompt(system_prompt.clone())
             .with_approver(approver.clone())
             .with_max_steps(selected_harness.max_steps().into());
+        let agent = match skill_tool.clone() {
+            Some(skill_tool) => agent.with_skill_tool(skill_tool),
+            None => agent,
+        };
         let providers_page = cx.new(|_| {
             ProvidersPage::new(
                 credential_input.clone(),
@@ -599,6 +605,7 @@ impl Workspace {
             credential_environment_override,
             credential_file_configured,
             tools,
+            skill_tool,
             terminal_tool,
             approver,
             changes: WorkspaceChangesState::NotRepository,
@@ -690,12 +697,22 @@ impl Workspace {
         cx.notify();
     }
 
+    #[cfg(test)]
     fn build_tools(
         home: &std::path::Path,
         workspace_root: &std::path::Path,
         harness: &HarnessSetup,
     ) -> Arc<ToolRegistry> {
+        Self::build_tools_with_skills(home, workspace_root, harness).0
+    }
+
+    fn build_tools_with_skills(
+        home: &std::path::Path,
+        workspace_root: &std::path::Path,
+        harness: &HarnessSetup,
+    ) -> (Arc<ToolRegistry>, Option<Arc<SkillTool>>) {
         let mut tools = ToolRegistry::new();
+        let mut skill_tool = None;
         if harness.enables("echo") {
             tools.register(Arc::new(EchoTool));
         }
@@ -713,9 +730,9 @@ impl Workspace {
             });
             if let Ok(provider) = provider {
                 if skills.register_provider(Arc::new(provider)).is_ok() {
-                    tools.register(Arc::new(
-                        SkillTool::new(Arc::new(skills)).with_cwd(workspace_root),
-                    ));
+                    let tool = Arc::new(SkillTool::new(Arc::new(skills)).with_cwd(workspace_root));
+                    tools.register(tool.clone());
+                    skill_tool = Some(tool);
                 }
             }
         }
@@ -725,7 +742,7 @@ impl Workspace {
             .any(|tool| harness.enables(tool));
         if needs_filesystem {
             let Ok(filesystem) = ScopedFs::new(workspace_root) else {
-                return Arc::new(tools);
+                return (Arc::new(tools), skill_tool);
             };
             let filesystem = Arc::new(filesystem);
             if harness.enables("read_file") {
@@ -756,7 +773,7 @@ impl Workspace {
                 Err(error) => eprintln!("shell policy load failed ({error}); shell stays disabled"),
             }
         }
-        Arc::new(tools)
+        (Arc::new(tools), skill_tool)
     }
 
     fn build_terminal_tool(
@@ -897,11 +914,15 @@ impl Workspace {
         let selection = ModelSelection::select_from_environment(Some(&self.home))
             .map_err(|error| error.to_string())?;
         let harness = self.selected_harness();
-        self.agent = AgentLoop::new(selection.adapter.clone(), self.tools.clone())
+        let agent = AgentLoop::new(selection.adapter.clone(), self.tools.clone())
             .with_default_model(Some(selection.model.clone()))
             .with_system_prompt(harness.system_prompt().render())
             .with_approver(self.approver.clone())
             .with_max_steps(harness.max_steps().into());
+        self.agent = match self.skill_tool.clone() {
+            Some(skill_tool) => agent.with_skill_tool(skill_tool),
+            None => agent,
+        };
         self.model = selection.model;
         Ok(())
     }
@@ -1148,7 +1169,10 @@ impl Workspace {
             self.workspace_root = space.root().to_path_buf();
             self.selected_harness_id = harness_id;
             let harness = self.selected_harness();
-            self.tools = Self::build_tools(&self.home, &self.workspace_root, &harness);
+            let (tools, skill_tool) =
+                Self::build_tools_with_skills(&self.home, &self.workspace_root, &harness);
+            self.tools = tools;
+            self.skill_tool = skill_tool;
             self.terminal_tool = Self::build_terminal_tool(&self.home, &self.workspace_root);
             if let Err(error) = self.reload_model() {
                 self.status = SharedString::from(format!(
@@ -1176,7 +1200,10 @@ impl Workspace {
 
         self.workspace_root = space.root().to_path_buf();
         let harness = self.selected_harness();
-        self.tools = Self::build_tools(&self.home, &self.workspace_root, &harness);
+        let (tools, skill_tool) =
+            Self::build_tools_with_skills(&self.home, &self.workspace_root, &harness);
+        self.tools = tools;
+        self.skill_tool = skill_tool;
         self.terminal_tool = Self::build_terminal_tool(&self.home, &self.workspace_root);
         if let Err(error) = self.reload_model() {
             self.status = SharedString::from(format!("Could not activate space: {error}"));
@@ -1343,7 +1370,10 @@ impl Workspace {
         };
 
         self.selected_harness_id = harness_id.to_string();
-        self.tools = Self::build_tools(&self.home, &self.workspace_root, &harness);
+        let (tools, skill_tool) =
+            Self::build_tools_with_skills(&self.home, &self.workspace_root, &harness);
+        self.tools = tools;
+        self.skill_tool = skill_tool;
         if let Err(error) = self.reload_model() {
             self.status = SharedString::from(format!("Could not activate setup: {error}"));
             cx.notify();
@@ -4232,6 +4262,7 @@ mod tests {
     use gpui::AssetSource;
     use harness_core::events::{TodoItem, TodoStatus};
     use harness_core::harness::HarnessSetupsConfig;
+    use harness_core::skills::SkillCatalogEntry;
     use harness_core::spaces::SpacesConfig;
     use harness_core::tools::ToolInvocation;
 
@@ -4274,6 +4305,46 @@ mod tests {
             Workspace::build_tools(home.path(), root.path(), setups.get("standard").unwrap());
 
         assert!(tools.specs().iter().any(|spec| spec.name == "skill"));
+    }
+
+    #[tokio::test]
+    async fn build_tools_returns_the_pre_step_skill_handle() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let skill_path = home.path().join(".dsh/skills/prestep/SKILL.md");
+        std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skill_path,
+            "---\nname: prestep\ndescription: Pre-step skill\n---\n\nFollow it.\n",
+        )
+        .unwrap();
+        let setups = HarnessSetupsConfig::default();
+
+        let (tools, skill_tool) = Workspace::build_tools_with_skills(
+            home.path(),
+            root.path(),
+            setups.get("standard").unwrap(),
+        );
+        assert!(tools.specs().iter().any(|spec| spec.name == "skill"));
+        let entries = skill_tool
+            .expect("standard setup retains its pre-step skill handle")
+            .catalog_entries()
+            .await
+            .unwrap();
+        assert_eq!(
+            entries,
+            vec![SkillCatalogEntry {
+                name: "prestep".into(),
+                description: "Pre-step skill".into(),
+            }]
+        );
+
+        let (_, missing) = Workspace::build_tools_with_skills(
+            home.path(),
+            root.path(),
+            setups.get("research").unwrap(),
+        );
+        assert!(missing.is_none());
     }
 
     #[test]
