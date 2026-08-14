@@ -42,6 +42,8 @@ pub struct SkillPickerState {
     active: Option<usize>,
     token: Option<SlashToken>,
     dismissed: Option<(Range<usize>, String)>,
+    next_open_generation: u64,
+    open_generation: Option<u64>,
 }
 
 impl SkillPickerState {
@@ -52,6 +54,7 @@ impl SkillPickerState {
 
     pub fn update(&mut self, text: &str, cursor: usize) {
         let token = slash_token(text, cursor);
+        let was_open = self.token.is_some();
         let still_dismissed = token.as_ref().is_some_and(|token| {
             self.dismissed.as_ref().is_some_and(|(range, value)| {
                 token.range == *range && text.get(range.clone()) == Some(value.as_str())
@@ -61,16 +64,27 @@ impl SkillPickerState {
             self.token = None;
             self.filtered.clear();
             self.active = None;
+            self.open_generation = None;
             return;
         }
 
         self.dismissed = None;
         self.token = token;
+        if self.token.is_some() && !was_open {
+            self.next_open_generation += 1;
+            self.open_generation = Some(self.next_open_generation);
+        } else if self.token.is_none() {
+            self.open_generation = None;
+        }
         self.refilter();
     }
 
     pub fn is_open(&self) -> bool {
         self.token.is_some()
+    }
+
+    pub fn open_generation(&self) -> Option<u64> {
+        self.open_generation
     }
 
     pub fn filtered_entries(&self) -> impl Iterator<Item = &SkillPickerEntry> {
@@ -109,6 +123,7 @@ impl SkillPickerState {
         self.token = None;
         self.filtered.clear();
         self.active = None;
+        self.open_generation = None;
         self.dismissed = dismissed;
         Some(token)
     }
@@ -119,6 +134,7 @@ impl SkillPickerState {
         self.token = None;
         self.filtered.clear();
         self.active = None;
+        self.open_generation = None;
         self.dismissed = None;
         Some((token, name))
     }
@@ -344,6 +360,25 @@ mod tests {
         assert_eq!(accepted.0.range, 0..3);
         assert_eq!(accepted.1, "prestep");
         assert!(!state.is_open());
+    }
+
+    #[test]
+    fn picker_open_generation_changes_only_between_menu_sessions() {
+        let mut state = SkillPickerState::default();
+        state.update("no slash", 8);
+        assert_eq!(state.open_generation(), None);
+
+        state.update("/", 1);
+        assert_eq!(state.open_generation(), Some(1));
+
+        state.update("/p", 2);
+        assert_eq!(state.open_generation(), Some(1));
+
+        state.dismiss("/p");
+        assert_eq!(state.open_generation(), None);
+
+        state.update("/", 1);
+        assert_eq!(state.open_generation(), Some(2));
     }
 
     #[test]
