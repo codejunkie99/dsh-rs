@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::input::ChatInput;
+use crate::input::{ChatInput, InputKind};
 use gpui::{
     actions, div, prelude::*, px, rgb, Context, Entity, FontWeight, MouseButton, SharedString,
     Window,
@@ -15,12 +15,23 @@ use harness_core::tools::fs::{ListDirTool, ReadFileTool, ScopedFs, WriteFileTool
 use harness_core::tools::shell::{CommandTool, ShellPolicy};
 use harness_core::tools::{EchoTool, ToolRegistry};
 
-actions!(workspace, [Submit, NewSession, CancelTurn]);
+actions!(
+    workspace,
+    [
+        Submit,
+        NewSession,
+        CancelTurn,
+        SearchSessions,
+        RenameSession
+    ]
+);
 
 pub struct Workspace {
     store: Arc<SessionStore>,
     agent: AgentLoop,
     pub(crate) input: Entity<ChatInput>,
+    search_input: Entity<ChatInput>,
+    rename_input: Entity<ChatInput>,
     summaries: Vec<SessionSummary>,
     selected: Option<harness_core::session::SharedSessionLog>,
     selected_view: Option<SessionView>,
@@ -29,11 +40,14 @@ pub struct Workspace {
     model: String,
     pending_approval: Option<ApprovalRequest>,
     cancellation: Option<TurnCancellation>,
+    search_matches: Option<Vec<uuid::Uuid>>,
 }
 
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let input = cx.new(crate::input::ChatInput::new);
+        let input = cx.new(|cx| ChatInput::new(InputKind::Chat, cx));
+        let search_input = cx.new(|cx| ChatInput::new(InputKind::Search, cx));
+        let rename_input = cx.new(|cx| ChatInput::new(InputKind::Rename, cx));
         let root = Self::sessions_root();
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
@@ -111,6 +125,8 @@ impl Workspace {
             store,
             agent,
             input,
+            search_input,
+            rename_input,
             summaries: Vec::new(),
             selected: None,
             selected_view: None,
@@ -119,6 +135,7 @@ impl Workspace {
             model: selection.model.clone(),
             pending_approval: None,
             cancellation: None,
+            search_matches: None,
         };
         let workspace_handle = cx.entity();
         cx.spawn(async move |_, cx| {
@@ -166,8 +183,10 @@ impl Workspace {
         match self.store.create("New session", Some(self.model.clone())) {
             Ok(log) => {
                 self.selected = Some(log);
+                self.search_matches = None;
                 self.status = SharedString::from("New session created.");
                 self.refresh();
+                self.sync_rename_input(cx);
             }
             Err(error) => {
                 self.status = SharedString::from(format!("Could not create session: {error}"))
@@ -183,8 +202,65 @@ impl Workspace {
             self.selected = Some(log);
             self.status = SharedString::from("Session loaded.");
             self.refresh();
+            self.sync_rename_input(cx);
         } else {
             self.status = SharedString::from("Session no longer exists.");
+        }
+        cx.notify();
+    }
+
+    fn sync_rename_input(&mut self, cx: &mut Context<Self>) {
+        let title = self
+            .selected_view
+            .as_ref()
+            .map(|view| view.title.clone())
+            .unwrap_or_default();
+        self.rename_input
+            .update(cx, |input, cx| input.set_text(title, cx));
+    }
+
+    fn search_sessions(&mut self, _: &SearchSessions, _: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search_input.read(cx).text();
+        if query.trim().is_empty() {
+            self.search_matches = None;
+            self.status = SharedString::from("Search cleared.");
+        } else {
+            let matches = self.store.search(&query);
+            let count = matches.len();
+            self.search_matches = Some(
+                matches
+                    .into_iter()
+                    .map(|result| result.session_id)
+                    .collect(),
+            );
+            self.status = SharedString::from(format!(
+                "{count} session{} matched.",
+                if count == 1 { "" } else { "s" }
+            ));
+        }
+        cx.notify();
+    }
+
+    fn rename_selected(&mut self, _: &RenameSession, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(selected) = self.selected.clone() else {
+            self.status = SharedString::from("No selected session to rename.");
+            cx.notify();
+            return;
+        };
+        let title = self.rename_input.read(cx).text();
+        let title = title.trim();
+        if title.is_empty() {
+            self.status = SharedString::from("Session title cannot be empty.");
+            cx.notify();
+            return;
+        }
+        match self.store.rename(selected.id(), title) {
+            Ok(_) => {
+                self.refresh();
+                self.sync_rename_input(cx);
+                self.status = SharedString::from("Session renamed.");
+            }
+            Err(error) => self.status = SharedString::from(format!("Rename failed: {error}")),
         }
         cx.notify();
     }
@@ -204,8 +280,10 @@ impl Workspace {
         match self.store.fork(source.id(), None, title) {
             Ok(fork) => {
                 self.selected = Some(fork);
+                self.search_matches = None;
                 self.status = SharedString::from("Session forked.");
                 self.refresh();
+                self.sync_rename_input(cx);
             }
             Err(error) => self.status = SharedString::from(format!("Could not fork: {error}")),
         }
@@ -298,6 +376,7 @@ impl Workspace {
                     workspace.busy = false;
                     workspace.cancellation = None;
                     workspace.refresh();
+                    workspace.sync_rename_input(cx);
                     workspace.status = match result {
                         Ok(harness_core::agent::TurnOutcome::Completed) => {
                             SharedString::from("Turn complete.")
@@ -339,6 +418,16 @@ impl Workspace {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let visible_summaries: Vec<SessionSummary> = match &self.search_matches {
+            Some(matches) => self
+                .summaries
+                .iter()
+                .filter(|summary| matches.contains(&summary.id))
+                .cloned()
+                .collect(),
+            None => self.summaries.clone(),
+        };
+
         div()
             .w(px(280.))
             .h_full()
@@ -398,6 +487,8 @@ impl Workspace {
                             .child("New"),
                     ),
             )
+            .child(self.search_input.clone())
+            .child(self.rename_input.clone())
             .child(
                 div()
                     .flex()
@@ -441,7 +532,7 @@ impl Workspace {
                             .child("Export"),
                     ),
             )
-            .children(self.summaries.iter().map(|summary| {
+            .children(visible_summaries.iter().map(|summary| {
                 let id = summary.id;
                 let selected = self.selected.as_ref().is_some_and(|log| log.id() == id);
                 div()
@@ -633,6 +724,8 @@ impl Render for Workspace {
             .bg(rgb(0x0f1115))
             .text_color(rgb(0xe7e9ee))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::search_sessions))
+            .on_action(cx.listener(Self::rename_selected))
             .on_action(cx.listener(|workspace, _: &NewSession, _, cx| workspace.create_session(cx)))
             .on_action(cx.listener(Self::cancel_turn))
             .child(self.render_sidebar(cx))

@@ -26,8 +26,49 @@ actions!(
     ]
 );
 
+#[cfg(test)]
+mod kind_tests {
+    use super::InputKind;
+
+    #[test]
+    fn input_kinds_use_distinct_contexts_and_placeholders() {
+        assert_eq!(InputKind::Chat.key_context(), "ChatInput");
+        assert_eq!(InputKind::Chat.placeholder(), "Message DeepSeek Harness");
+        assert_eq!(InputKind::Search.key_context(), "SearchInput");
+        assert_eq!(InputKind::Search.placeholder(), "Search sessions");
+        assert_eq!(InputKind::Rename.key_context(), "RenameInput");
+        assert_eq!(InputKind::Rename.placeholder(), "Session title");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputKind {
+    Chat,
+    Search,
+    Rename,
+}
+
+impl InputKind {
+    pub fn key_context(self) -> &'static str {
+        match self {
+            Self::Chat => "ChatInput",
+            Self::Search => "SearchInput",
+            Self::Rename => "RenameInput",
+        }
+    }
+
+    pub fn placeholder(self) -> &'static str {
+        match self {
+            Self::Chat => "Message DeepSeek Harness",
+            Self::Search => "Search sessions",
+            Self::Rename => "Session title",
+        }
+    }
+}
+
 pub struct ChatInput {
     focus_handle: FocusHandle,
+    kind: InputKind,
     content: String,
     placeholder: &'static str,
     selected_range: Range<usize>,
@@ -38,11 +79,12 @@ pub struct ChatInput {
 }
 
 impl ChatInput {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(kind: InputKind, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            kind,
             content: String::new(),
-            placeholder: "Message DeepSeek Harness",
+            placeholder: kind.placeholder(),
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -57,6 +99,14 @@ impl ChatInput {
 
     pub fn text(&self) -> String {
         self.content.clone()
+    }
+
+    pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.content = text.into();
+        self.selected_range = self.content.len()..self.content.len();
+        self.selection_reversed = false;
+        self.marked_range = None;
+        cx.notify();
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
@@ -441,7 +491,7 @@ impl Element for ChatTextElement {
 impl Render for ChatInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .key_context("ChatInput")
+            .key_context(self.kind.key_context())
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))

@@ -8,7 +8,7 @@ use gpui::{
 use input::{
     Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft, SelectRight,
 };
-use workspace::{CancelTurn, NewSession, Submit, Workspace};
+use workspace::{CancelTurn, NewSession, RenameSession, SearchSessions, Submit, Workspace};
 
 const APP_TITLE: &str = "DeepSeek Harness RS";
 actions!(dsh_app, [Quit]);
@@ -17,20 +17,22 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("enter", Submit, Some("ChatInput")),
+            KeyBinding::new("enter", SearchSessions, Some("SearchInput")),
+            KeyBinding::new("enter", RenameSession, Some("RenameInput")),
             KeyBinding::new("cmd-n", NewSession, Some("Workspace")),
             KeyBinding::new("cmd-.", CancelTurn, Some("Workspace")),
-            KeyBinding::new("backspace", Backspace, Some("ChatInput")),
-            KeyBinding::new("delete", Delete, Some("ChatInput")),
-            KeyBinding::new("left", Left, Some("ChatInput")),
-            KeyBinding::new("right", Right, Some("ChatInput")),
-            KeyBinding::new("shift-left", SelectLeft, Some("ChatInput")),
-            KeyBinding::new("shift-right", SelectRight, Some("ChatInput")),
-            KeyBinding::new("cmd-a", SelectAll, Some("ChatInput")),
-            KeyBinding::new("cmd-v", Paste, Some("ChatInput")),
-            KeyBinding::new("cmd-c", Copy, Some("ChatInput")),
-            KeyBinding::new("cmd-x", Cut, Some("ChatInput")),
-            KeyBinding::new("home", Home, Some("ChatInput")),
-            KeyBinding::new("end", End, Some("ChatInput")),
+            KeyBinding::new("backspace", Backspace, None),
+            KeyBinding::new("delete", Delete, None),
+            KeyBinding::new("left", Left, None),
+            KeyBinding::new("right", Right, None),
+            KeyBinding::new("shift-left", SelectLeft, None),
+            KeyBinding::new("shift-right", SelectRight, None),
+            KeyBinding::new("cmd-a", SelectAll, None),
+            KeyBinding::new("cmd-v", Paste, None),
+            KeyBinding::new("cmd-c", Copy, None),
+            KeyBinding::new("cmd-x", Cut, None),
+            KeyBinding::new("home", Home, None),
+            KeyBinding::new("end", End, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
 

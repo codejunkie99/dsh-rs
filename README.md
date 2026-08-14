@@ -8,8 +8,9 @@ A native Rust + GPUI desktop milestone for the DeepSeek Harness agent model. It 
 - Append-only, replayable JSONL session logs.
 - Automatic bounded session titles from the first user message.
 - Session sidebar with model, event count, and active-turn state.
+- Native sidebar search and rename fields.
 - Session forking at the current boundary and Markdown export.
-- Case-insensitive session title/transcript search API.
+- Case-insensitive session title/transcript search.
 - Transcript projection for user, assistant, tool, and system events.
 - Adapter-driven turn/step agent loop.
 - DeepSeek OpenAI-compatible streaming adapter with environment and private credential-file key resolution.
@@ -52,6 +53,8 @@ Sessions are stored in:
 ```
 
 Each line is one typed session event. Delete the directory to reset local state. Corrupt files are skipped without preventing valid sessions from loading.
+
+The sidebar search field filters titles and transcript content. Enter in the rename field updates the selected session title as a durable `session_title_changed` event.
 
 Fork copies all durable events through the selected boundary into a new session ID and JSONL file. Markdown exports are written to:
 
