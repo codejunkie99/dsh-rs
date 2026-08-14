@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::changes::{
@@ -17,8 +18,9 @@ use crate::terminal::{
 };
 use crate::theme::{self, Theme};
 use gpui::{
-    actions, div, prelude::*, px, AnyElement, Context, Entity, FontWeight, MouseButton,
-    SharedString, Subscription, Window, WindowControlArea,
+    actions, div, linear_color_stop, linear_gradient, prelude::*, px, AnimationExt, AnyElement,
+    Context, Entity, FontWeight, MouseButton, SharedString, Subscription, Window,
+    WindowControlArea,
 };
 use harness_core::agent::AgentLoop;
 use harness_core::approval::{
@@ -142,6 +144,22 @@ impl SettingsSection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillRowState {
+    Running,
+    Ok,
+    Error,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillRowModel {
+    name: String,
+    output: Option<String>,
+    error_summary: Option<String>,
+    state: SkillRowState,
+}
+
 pub struct Workspace {
     store: Arc<SessionStore>,
     agent: AgentLoop,
@@ -185,6 +203,7 @@ pub struct Workspace {
     terminal_history: TerminalHistory,
     terminal_running: bool,
     todo_panel_collapsed: bool,
+    expanded_skill_calls: HashSet<String>,
     route: Route,
     sidebar_space_filter: Option<String>,
     spaces_menu_open: bool,
@@ -244,6 +263,56 @@ impl Workspace {
             .filter(|todo| todo.status == TodoStatus::Completed)
             .count();
         Some(format!("{done}/{} done", todos.len()))
+    }
+
+    fn first_line(value: &str) -> &str {
+        value.split('\n').next().unwrap_or("")
+    }
+
+    fn skill_call_name(call_id: &str, arguments: &serde_json::Value) -> String {
+        if let Some(name) = arguments.get("name").and_then(|value| value.as_str()) {
+            if !name.is_empty() {
+                return Self::first_line(name).to_string();
+            }
+        }
+        let raw = serde_json::to_string(arguments).unwrap_or_default();
+        if raw.is_empty() {
+            call_id.to_string()
+        } else {
+            Self::first_line(&raw).to_string()
+        }
+    }
+
+    fn skill_row_model(
+        call_id: &str,
+        arguments: &serde_json::Value,
+        output: Option<(&str, bool)>,
+    ) -> SkillRowModel {
+        let Some((output, ok)) = output else {
+            return SkillRowModel {
+                name: Self::skill_call_name(call_id, arguments),
+                output: None,
+                error_summary: None,
+                state: SkillRowState::Running,
+            };
+        };
+
+        let output = output.to_string();
+        let normalized = output.to_lowercase();
+        let state = if ok {
+            SkillRowState::Ok
+        } else if normalized.contains("cancelled") || normalized.contains("interrupted") {
+            SkillRowState::Stopped
+        } else {
+            SkillRowState::Error
+        };
+        SkillRowModel {
+            name: Self::skill_call_name(call_id, arguments),
+            error_summary: (state == SkillRowState::Error)
+                .then(|| Self::first_line(&output).to_string()),
+            output: Some(output),
+            state,
+        }
     }
 
     fn todo_panel_progress(todos: &[TodoItem]) -> String {
@@ -544,6 +613,7 @@ impl Workspace {
             terminal_history: TerminalHistory::new(20),
             terminal_running: false,
             todo_panel_collapsed: true,
+            expanded_skill_calls: HashSet::new(),
             route: Route::Chat,
             sidebar_space_filter: Some(selected_space_id.clone()),
             spaces_menu_open: false,
@@ -1808,6 +1878,193 @@ impl Workspace {
             .into_any_element()
     }
 
+    fn render_skill_call(
+        &self,
+        call_id: &str,
+        arguments: &serde_json::Value,
+        output: Option<(&str, bool)>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let model = Self::skill_row_model(call_id, arguments, output);
+        let expandable = model.output.is_some();
+        let expanded = expandable && self.expanded_skill_calls.contains(call_id);
+        let output = model.output.clone();
+        let summary = model.error_summary.clone().unwrap_or(model.name.clone());
+        let summary_color = match model.state {
+            SkillRowState::Error => theme.danger_muted,
+            SkillRowState::Stopped => theme.warning_muted,
+            _ => theme.text_faint,
+        };
+        let leading_color = match model.state {
+            SkillRowState::Error | SkillRowState::Stopped => summary_color,
+            _ => theme.text_faint,
+        };
+        let leading = match model.state {
+            SkillRowState::Error | SkillRowState::Stopped => div()
+                .size(px(6.0))
+                .rounded_full()
+                .bg(leading_color)
+                .into_any_element(),
+            SkillRowState::Running | SkillRowState::Ok => icon(icons::SKILL)
+                .size(px(14.0))
+                .text_color(leading_color)
+                .into_any_element(),
+        };
+        let toggle_call_id = call_id.to_string();
+
+        let row = div()
+            .id(SharedString::from(format!("skill-row-{call_id}")))
+            .min_h(px(24.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .when(expandable, |element| {
+                element.cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |workspace, _, _, cx| {
+                        if workspace.expanded_skill_calls.contains(&toggle_call_id) {
+                            workspace.expanded_skill_calls.remove(&toggle_call_id);
+                        } else {
+                            workspace
+                                .expanded_skill_calls
+                                .insert(toggle_call_id.clone());
+                        }
+                        cx.notify();
+                    }),
+                )
+            })
+            .child(
+                div()
+                    .size(px(16.0))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .child(leading),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(14.0))
+                    .text_color(theme.text_muted)
+                    .child("Skill"),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(2.0))
+                    .rounded_full()
+                    .bg(theme.text_faint.opacity(0.6)),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(14.0))
+                    .text_color(summary_color)
+                    .child(SharedString::from(summary)),
+            )
+            .when(expandable, |element| {
+                element.child(
+                    icon(icons::ALT_ARROW_DOWN)
+                        .size(px(14.0))
+                        .text_color(theme.text_faint),
+                )
+            });
+        let row = if model.state == SkillRowState::Running {
+            let sweep_bg = theme.bg;
+            row.with_animation(
+                SharedString::from(format!("skill-row-sweep-{call_id}")),
+                motion::SKILL_SWEEP.repeating(),
+                move |element, delta| {
+                    let transparent = linear_color_stop(sweep_bg.opacity(0.0), 0.0);
+                    let tint = linear_color_stop(sweep_bg.opacity(0.6), 1.0);
+                    element.relative().overflow_hidden().child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(motion::skill_sweep_left(delta)))
+                            .w(px(300.0))
+                            .flex()
+                            .flex_row()
+                            .child(div().h_full().flex_1().bg(linear_gradient(
+                                90.0,
+                                transparent,
+                                tint,
+                            )))
+                            .child(div().h_full().flex_1().bg(linear_gradient(
+                                90.0,
+                                tint,
+                                transparent,
+                            ))),
+                    )
+                },
+            )
+            .into_any_element()
+        } else {
+            row.into_any_element()
+        };
+
+        div()
+            .id(SharedString::from(format!("skill-call-{call_id}")))
+            .w_full()
+            .max_w(px(820.0))
+            .flex()
+            .flex_col()
+            .child(row)
+            .when(expanded, |element| {
+                let output = output.unwrap_or_default();
+                element.child(
+                    div()
+                        .id(SharedString::from(format!("skill-instructions-{call_id}")))
+                        .ml(px(4.0))
+                        .mt(px(4.0))
+                        .max_h(px(260.0))
+                        .overflow_hidden()
+                        .rounded(px(12.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.surface_raised)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .px(px(12.0))
+                                .py(px(8.0))
+                                .border_b_1()
+                                .border_color(theme.border)
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.text_faint)
+                                .child("INSTRUCTIONS"),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "skill-instructions-body-{call_id}"
+                                )))
+                                .max_h(px(216.0))
+                                .overflow_scroll()
+                                .px(px(12.0))
+                                .py(px(10.0))
+                                .font_family(theme.font_mono.clone())
+                                .text_size(px(12.0))
+                                .text_color(if model.state == SkillRowState::Error {
+                                    theme.danger_muted
+                                } else {
+                                    theme.text_muted
+                                })
+                                .child(SharedString::from(output)),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_todo_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let todos = self
             .selected_view
@@ -2390,6 +2647,31 @@ impl Workspace {
             .as_ref()
             .map(|view| view.transcript.as_slice())
             .unwrap_or(&[]);
+        let skill_call_ids: HashSet<&str> = transcript
+            .iter()
+            .filter_map(|entry| {
+                if let TranscriptEntry::ToolCall { id, name, .. } = entry {
+                    (name == "skill").then_some(id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let skill_results: HashMap<&str, (&str, bool)> = transcript
+            .iter()
+            .filter_map(|entry| {
+                if let TranscriptEntry::ToolResult {
+                    call_id,
+                    output,
+                    ok,
+                } = entry
+                {
+                    Some((call_id.as_str(), (output.as_str(), *ok)))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         let list = div()
             .id("transcript")
@@ -2399,49 +2681,76 @@ impl Workspace {
             .flex()
             .flex_col()
             .gap_3()
-            .children(transcript.iter().map(|entry| {
-                if let TranscriptEntry::ToolCall {
-                    name, arguments, ..
-                } = entry
-                {
-                    if name == "todo_write" {
-                        return Self::render_todo_call(arguments, &theme);
-                    }
-                }
-                let (role, text, color) = match entry {
-                    TranscriptEntry::User { content, .. } => ("You", content, theme.text),
-                    TranscriptEntry::Assistant { content, .. } => {
-                        ("Assistant", content, theme.text)
-                    }
-                    TranscriptEntry::ToolCall { name, .. } => ("Tool call", name, theme.warning),
-                    TranscriptEntry::ToolResult { output, .. } => {
-                        ("Tool result", output, theme.success)
-                    }
-                    TranscriptEntry::System { message } => ("System", message, theme.danger),
-                };
-                div()
-                    .max_w(px(820.))
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(theme.surface_raised)
-                    .border_1()
-                    .border_color(theme.border)
-                    .child(
+            .children(
+                transcript
+                    .iter()
+                    .filter(|entry| {
+                        !matches!(
+                            entry,
+                            TranscriptEntry::ToolResult { call_id, .. }
+                                if skill_call_ids.contains(call_id.as_str())
+                        )
+                    })
+                    .map(|entry| {
+                        if let TranscriptEntry::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                            ..
+                        } = entry
+                        {
+                            if name == "todo_write" {
+                                return Self::render_todo_call(arguments, &theme);
+                            }
+                            if name == "skill" {
+                                return self.render_skill_call(
+                                    id,
+                                    arguments,
+                                    skill_results.get(id.as_str()).copied(),
+                                    &theme,
+                                    cx,
+                                );
+                            }
+                        }
+                        let (role, text, color) = match entry {
+                            TranscriptEntry::User { content, .. } => ("You", content, theme.text),
+                            TranscriptEntry::Assistant { content, .. } => {
+                                ("Assistant", content, theme.text)
+                            }
+                            TranscriptEntry::ToolCall { name, .. } => {
+                                ("Tool call", name, theme.warning)
+                            }
+                            TranscriptEntry::ToolResult { output, .. } => {
+                                ("Tool result", output, theme.success)
+                            }
+                            TranscriptEntry::System { message } => {
+                                ("System", message, theme.danger)
+                            }
+                        };
                         div()
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text_faint)
-                            .child(role),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .text_color(color)
-                            .child(text.clone()),
-                    )
-                    .into_any_element()
-            }));
+                            .max_w(px(820.))
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(theme.surface_raised)
+                            .border_1()
+                            .border_color(theme.border)
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.text_faint)
+                                    .child(role),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .text_color(color)
+                                    .child(text.clone()),
+                            )
+                            .into_any_element()
+                    }),
+            );
 
         edge_faded(Theme::TRANSCRIPT_FADE_BAND, true, true, list)
             .inset_top(Theme::TITLEBAR_HEIGHT)
@@ -3920,6 +4229,7 @@ impl Render for Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::AssetSource;
     use harness_core::events::{TodoItem, TodoStatus};
     use harness_core::harness::HarnessSetupsConfig;
     use harness_core::spaces::SpacesConfig;
@@ -3964,6 +4274,70 @@ mod tests {
             Workspace::build_tools(home.path(), root.path(), setups.get("standard").unwrap());
 
         assert!(tools.specs().iter().any(|spec| spec.name == "skill"));
+    }
+
+    #[test]
+    fn skill_row_model_is_replay_stable_and_tracks_dsh_lifecycle() {
+        let arguments = serde_json::json!({"name": "dsh-manage-issues"});
+        let running = Workspace::skill_row_model("call-skill", &arguments, None);
+        assert_eq!(running.name, "dsh-manage-issues");
+        assert_eq!(running.state, SkillRowState::Running);
+        assert_eq!(running.output, None);
+        assert_eq!(running.error_summary, None);
+
+        let output = "<skill_content name=\"dsh-manage-issues\">Instructions</skill_content>";
+        let ok = Workspace::skill_row_model("call-skill", &arguments, Some((output, true)));
+        assert_eq!(ok.state, SkillRowState::Ok);
+        assert_eq!(ok.output.as_deref(), Some(output));
+        assert_eq!(ok.error_summary, None);
+
+        let error_text = "SkillError: missing resource\nCheck SKILL.md.";
+        let error = Workspace::skill_row_model("call-skill", &arguments, Some((error_text, false)));
+        assert_eq!(error.state, SkillRowState::Error);
+        assert_eq!(
+            error.error_summary.as_deref(),
+            Some("SkillError: missing resource")
+        );
+        assert_eq!(error.output.as_deref(), Some(error_text));
+
+        let stopped =
+            Workspace::skill_row_model("call-skill", &arguments, Some(("turn cancelled", false)));
+        assert_eq!(stopped.state, SkillRowState::Stopped);
+    }
+
+    #[test]
+    fn skill_row_name_falls_back_to_durable_call_data() {
+        assert_eq!(
+            Workspace::skill_call_name(
+                "call-skill",
+                &serde_json::json!({"name": "dsh-manage-issues"})
+            ),
+            "dsh-manage-issues"
+        );
+        assert_eq!(
+            Workspace::skill_call_name("call-skill", &serde_json::json!({"name": ""})),
+            "{\"name\":\"\"}"
+        );
+        assert_eq!(
+            Workspace::skill_call_name("call-skill", &serde_json::json!("raw-name")),
+            "\"raw-name\""
+        );
+        assert_eq!(
+            Workspace::skill_call_name("call-skill", &serde_json::json!({"name": "first\nsecond"})),
+            "first"
+        );
+    }
+
+    #[test]
+    fn skill_icon_is_available_at_comet_tool_row_scale() {
+        let assets = crate::icons::Assets;
+        let bytes = assets
+            .load(icons::SKILL)
+            .expect("skill icon asset resolves")
+            .expect("skill icon asset exists");
+        let text = std::str::from_utf8(&bytes).expect("skill icon is utf-8");
+        assert!(text.contains("viewBox=\"0 0 16 16\""));
+        assert!(text.contains("12.5113 15.4067"));
     }
 
     #[test]

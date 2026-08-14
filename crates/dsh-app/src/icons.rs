@@ -108,6 +108,7 @@ icon_assets![
     (DOCUMENT_ADD, "document-add"),
     (GLOBAL, "global"),
     (CHECKLIST, "checklist"),
+    (SKILL, "skill"),
     (WIDGET, "widget"),
     (WIFI_OFF, "wifi-off"),
     (CLOSE_CIRCLE, "close-circle"),
