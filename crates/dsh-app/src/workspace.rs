@@ -14,6 +14,7 @@ use harness_core::approval::{
     ApprovalPolicy, ApprovalRequest, ChannelApprover, GatedApprover, ToolApprover,
 };
 use harness_core::cancellation::TurnCancellation;
+use harness_core::harness::{HarnessSetup, HarnessSetupsConfig};
 use harness_core::prompt::SystemPromptConfig;
 use harness_core::remote::{CredentialStore, ModelSelection};
 use harness_core::session::{SessionView, TranscriptEntry};
@@ -36,7 +37,9 @@ actions!(
         ToggleSidebar,
         ToggleContext,
         NextSpace,
-        PreviousSpace
+        PreviousSpace,
+        NextHarness,
+        PreviousHarness
     ]
 );
 
@@ -58,13 +61,14 @@ pub struct Workspace {
     home: std::path::PathBuf,
     spaces_config: SpacesConfig,
     selected_space_id: String,
+    harness_setups: HarnessSetupsConfig,
+    selected_harness_id: String,
     workspace_root: std::path::PathBuf,
     credential_path: std::path::PathBuf,
     credential_environment_override: bool,
     credential_file_configured: bool,
     tools: Arc<ToolRegistry>,
     approver: Arc<dyn ToolApprover>,
-    system_prompt: Option<String>,
     changes: WorkspaceChangesState,
     changes_scanning: bool,
     selected_change: Option<(String, bool)>,
@@ -104,6 +108,10 @@ impl Workspace {
             .get(&selected_space_id)
             .map(|space| space.root().to_path_buf())
             .unwrap_or(workspace_root);
+        let harness_setups_path = home.join(".dsh-rs").join("harness-setups.json");
+        let harness_setups_existed = harness_setups_path.exists();
+        let (loaded_harness_setups, harness_load_error) =
+            Self::load_harness_setups(&harness_setups_path);
         let ui_settings_path = home.join(".dsh-rs").join("ui.json");
         let ui_settings = if ui_settings_path.exists() {
             UiSettings::load(&ui_settings_path).unwrap_or_else(|error| {
@@ -136,13 +144,35 @@ impl Workspace {
         if !prompt_path.exists() {
             let _ = SystemPromptConfig::default().save(&prompt_path);
         }
-        let system_prompt = match SystemPromptConfig::load(&prompt_path) {
-            Ok(config) => config.render(),
+        let prompt_config = match SystemPromptConfig::load(&prompt_path) {
+            Ok(config) => config,
             Err(error) => {
                 eprintln!("system prompt config load failed ({error}); using default identity");
-                SystemPromptConfig::default().render()
+                SystemPromptConfig::default()
             }
         };
+        let (harness_setups, harness_migration_error) = Self::prepare_harness_setups(
+            &harness_setups_path,
+            harness_setups_existed,
+            loaded_harness_setups,
+            prompt_config,
+        );
+        let selected_harness_id = harness_setups
+            .setups()
+            .first()
+            .map(|setup| setup.id().to_string())
+            .unwrap_or_else(|| "standard".to_string());
+        let selected_harness = harness_setups
+            .get(&selected_harness_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                HarnessSetupsConfig::default()
+                    .setups()
+                    .first()
+                    .cloned()
+                    .expect("default harness setups are nonempty")
+            });
+        let system_prompt = selected_harness.system_prompt().render();
         let (approval_channel, mut approval_requests) = ChannelApprover::channel();
         let approver = Arc::new(GatedApprover::new(approval_policy, approval_channel));
         let (store, status) = match SessionStore::open(&root) {
@@ -173,13 +203,21 @@ impl Workspace {
         } else {
             status
         };
+        let harness_setups_error = harness_load_error.or(harness_migration_error);
+        let status = if let Some(error) = harness_setups_error {
+            SharedString::from(format!(
+                "{status}. Harness setup config failed ({error}); using built-in setups."
+            ))
+        } else {
+            status
+        };
 
-        let tools = Self::build_tools(&home, &workspace_root);
+        let tools = Self::build_tools(&home, &workspace_root, &selected_harness);
         let agent = AgentLoop::new(selection.adapter.clone(), tools.clone())
             .with_default_model(Some(selection.model.clone()))
             .with_system_prompt(system_prompt.clone())
             .with_approver(approver.clone())
-            .with_max_steps(8);
+            .with_max_steps(selected_harness.max_steps().into());
 
         let mut workspace = Self {
             store,
@@ -199,13 +237,14 @@ impl Workspace {
             home,
             spaces_config,
             selected_space_id,
+            harness_setups,
+            selected_harness_id,
             workspace_root,
             credential_path,
             credential_environment_override,
             credential_file_configured,
             tools,
             approver,
-            system_prompt,
             changes: WorkspaceChangesState::NotRepository,
             changes_scanning: false,
             selected_change: None,
@@ -270,14 +309,33 @@ impl Workspace {
         cx.notify();
     }
 
-    fn build_tools(home: &std::path::Path, workspace_root: &std::path::Path) -> Arc<ToolRegistry> {
+    fn build_tools(
+        home: &std::path::Path,
+        workspace_root: &std::path::Path,
+        harness: &HarnessSetup,
+    ) -> Arc<ToolRegistry> {
         let mut tools = ToolRegistry::new();
-        tools.register(Arc::new(EchoTool));
-        if let Ok(filesystem) = ScopedFs::new(workspace_root) {
+        if harness.enables("echo") {
+            tools.register(Arc::new(EchoTool));
+        }
+
+        let needs_filesystem = ["read_file", "list_dir", "write_file", "run_command"]
+            .iter()
+            .any(|tool| harness.enables(tool));
+        if needs_filesystem {
+            let Ok(filesystem) = ScopedFs::new(workspace_root) else {
+                return Arc::new(tools);
+            };
             let filesystem = Arc::new(filesystem);
-            tools.register(Arc::new(ReadFileTool::new(filesystem.clone())));
-            tools.register(Arc::new(ListDirTool::new(filesystem.clone())));
-            tools.register(Arc::new(WriteFileTool::new(filesystem.clone())));
+            if harness.enables("read_file") {
+                tools.register(Arc::new(ReadFileTool::new(filesystem.clone())));
+            }
+            if harness.enables("list_dir") {
+                tools.register(Arc::new(ListDirTool::new(filesystem.clone())));
+            }
+            if harness.enables("write_file") {
+                tools.register(Arc::new(WriteFileTool::new(filesystem.clone())));
+            }
 
             let shell_path = home.join(".dsh-rs").join("shell.json");
             if !shell_path.exists() {
@@ -287,7 +345,10 @@ impl Workspace {
                     .save(&shell_path);
             }
             match ShellPolicy::load(&shell_path) {
-                Ok(shell_policy) if !shell_policy.allowed_binaries.is_empty() => {
+                Ok(shell_policy)
+                    if !shell_policy.allowed_binaries.is_empty()
+                        && harness.enables("run_command") =>
+                {
                     tools.register(Arc::new(CommandTool::new(filesystem, shell_policy)));
                 }
                 Ok(_) => {}
@@ -315,6 +376,38 @@ impl Workspace {
         }
     }
 
+    fn load_harness_setups(path: &std::path::Path) -> (HarnessSetupsConfig, Option<String>) {
+        let defaults = HarnessSetupsConfig::default();
+        if !path.exists() {
+            if let Err(error) = defaults.save(path) {
+                return (defaults, Some(error.to_string()));
+            }
+            return (defaults, None);
+        }
+
+        match HarnessSetupsConfig::load(path) {
+            Ok(config) => (config, None),
+            Err(error) => (defaults, Some(error.to_string())),
+        }
+    }
+
+    fn prepare_harness_setups(
+        path: &std::path::Path,
+        setup_file_existed: bool,
+        loaded: HarnessSetupsConfig,
+        legacy_prompt: SystemPromptConfig,
+    ) -> (HarnessSetupsConfig, Option<String>) {
+        if setup_file_existed {
+            return (loaded, None);
+        }
+
+        let migrated = loaded.with_standard_prompt(legacy_prompt);
+        if let Err(error) = migrated.save(path) {
+            return (migrated, Some(error.to_string()));
+        }
+        (migrated, None)
+    }
+
     fn resolve_space_id(config: &SpacesConfig, session_space_id: Option<&str>) -> String {
         session_space_id
             .filter(|id| config.get(id).is_some())
@@ -340,14 +433,51 @@ impl Workspace {
         Some(spaces[next].id().to_string())
     }
 
+    fn resolve_harness_id(
+        config: &HarnessSetupsConfig,
+        session_harness_id: Option<&str>,
+    ) -> String {
+        session_harness_id
+            .filter(|id| config.get(id).is_some())
+            .map(str::to_string)
+            .or_else(|| config.setups().first().map(|setup| setup.id().to_string()))
+            .unwrap_or_else(|| "standard".to_string())
+    }
+
+    fn cycled_harness_id(
+        config: &HarnessSetupsConfig,
+        current_harness_id: &str,
+        forward: bool,
+    ) -> Option<String> {
+        let setups = config.setups();
+        let index = setups
+            .iter()
+            .position(|setup| setup.id() == current_harness_id)?;
+        let next = if forward {
+            index + 1
+        } else {
+            index + setups.len().saturating_sub(1)
+        } % setups.len();
+        Some(setups[next].id().to_string())
+    }
+
+    fn selected_harness(&self) -> HarnessSetup {
+        self.harness_setups
+            .get(&self.selected_harness_id)
+            .cloned()
+            .or_else(|| self.harness_setups.setups().first().cloned())
+            .expect("harness setups config always has a fail-safe setup")
+    }
+
     fn reload_model(&mut self) -> Result<(), String> {
         let selection = ModelSelection::select_from_environment(Some(&self.home))
             .map_err(|error| error.to_string())?;
+        let harness = self.selected_harness();
         self.agent = AgentLoop::new(selection.adapter.clone(), self.tools.clone())
             .with_default_model(Some(selection.model.clone()))
-            .with_system_prompt(self.system_prompt.clone())
+            .with_system_prompt(harness.system_prompt().render())
             .with_approver(self.approver.clone())
-            .with_max_steps(8);
+            .with_max_steps(harness.max_steps().into());
         self.model = selection.model;
         Ok(())
     }
@@ -524,10 +654,13 @@ impl Workspace {
 
     fn create_session(&mut self, cx: &mut Context<Self>) {
         let space_id = self.selected_space_id.clone();
-        match self
-            .store
-            .create_in_space("New session", Some(self.model.clone()), Some(space_id))
-        {
+        let harness_id = self.selected_harness_id.clone();
+        match self.store.create_in_space_and_harness(
+            "New session",
+            Some(self.model.clone()),
+            Some(space_id),
+            Some(harness_id),
+        ) {
             Ok(log) => {
                 self.selected = Some(log);
                 self.search_matches = None;
@@ -547,7 +680,7 @@ impl Workspace {
             self.status = SharedString::from("Wait for the current turn to finish.");
         } else if let Some(log) = self.store.get(id) {
             self.selected = Some(log);
-            self.activate_space_for_selection();
+            self.activate_configuration_for_selection();
             self.refresh_changes(cx);
             self.status = SharedString::from("Session loaded.");
             self.refresh();
@@ -558,21 +691,27 @@ impl Workspace {
         cx.notify();
     }
 
-    fn activate_space_for_selection(&mut self) {
+    fn activate_configuration_for_selection(&mut self) {
         let Some(view) = self.selected.as_ref().map(|log| log.view()) else {
             return;
         };
         let space_id = Self::resolve_space_id(&self.spaces_config, view.space_id.as_deref());
+        let harness_id = Self::resolve_harness_id(&self.harness_setups, view.harness_id.as_deref());
         if let Some(space) = self.spaces_config.get(&space_id) {
             self.workspace_root = space.root().to_path_buf();
-            self.tools = Self::build_tools(&self.home, &self.workspace_root);
+            self.selected_harness_id = harness_id;
+            let harness = self.selected_harness();
+            self.tools = Self::build_tools(&self.home, &self.workspace_root, &harness);
             if let Err(error) = self.reload_model() {
                 self.status = SharedString::from(format!(
-                    "Space activated, but model reload failed: {error}"
+                    "Session configuration activated, but model reload failed: {error}"
                 ));
             }
         }
         self.selected_space_id = space_id;
+        if self.harness_setups.get(&self.selected_harness_id).is_none() {
+            self.selected_harness_id = Self::resolve_harness_id(&self.harness_setups, None);
+        }
     }
 
     fn select_space(&mut self, space_id: &str, cx: &mut Context<Self>) {
@@ -588,7 +727,8 @@ impl Workspace {
         };
 
         self.workspace_root = space.root().to_path_buf();
-        self.tools = Self::build_tools(&self.home, &self.workspace_root);
+        let harness = self.selected_harness();
+        self.tools = Self::build_tools(&self.home, &self.workspace_root, &harness);
         if let Err(error) = self.reload_model() {
             self.status = SharedString::from(format!("Could not activate space: {error}"));
             cx.notify();
@@ -622,6 +762,58 @@ impl Workspace {
 
     fn previous_space(&mut self, _: &PreviousSpace, _: &mut Window, cx: &mut Context<Self>) {
         self.cycle_space(false, cx);
+    }
+
+    fn select_harness(&mut self, harness_id: &str, cx: &mut Context<Self>) {
+        if self.busy {
+            self.status = SharedString::from("Wait for the current turn to finish.");
+            cx.notify();
+            return;
+        }
+        let Some(harness) = self.harness_setups.get(harness_id).cloned() else {
+            self.status = SharedString::from("Harness setup no longer exists.");
+            cx.notify();
+            return;
+        };
+
+        self.selected_harness_id = harness_id.to_string();
+        self.tools = Self::build_tools(&self.home, &self.workspace_root, &harness);
+        if let Err(error) = self.reload_model() {
+            self.status = SharedString::from(format!("Could not activate setup: {error}"));
+            cx.notify();
+            return;
+        }
+        if let Some(selected) = &self.selected {
+            if let Err(error) = selected.set_harness(harness_id) {
+                self.status = SharedString::from(format!("Could not save session setup: {error}"));
+                cx.notify();
+                return;
+            }
+        }
+        self.refresh();
+        self.status = SharedString::from(format!(
+            "{} setup active. {} tools, {} max steps.",
+            harness.name(),
+            harness.enabled_tools().len(),
+            harness.max_steps()
+        ));
+        cx.notify();
+    }
+
+    fn cycle_harness(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Some(next) =
+            Self::cycled_harness_id(&self.harness_setups, &self.selected_harness_id, forward)
+        {
+            self.select_harness(&next, cx);
+        }
+    }
+
+    fn next_harness(&mut self, _: &NextHarness, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_harness(true, cx);
+    }
+
+    fn previous_harness(&mut self, _: &PreviousHarness, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_harness(false, cx);
     }
 
     fn sync_rename_input(&mut self, cx: &mut Context<Self>) {
@@ -959,6 +1151,60 @@ impl Workspace {
                             }))
                     }),
             )
+            .child(
+                div()
+                    .pt_2()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.faint)
+                    .child("HARNESS SETUPS"),
+            )
+            .children(
+                self.harness_setups
+                    .setups()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, setup)| {
+                        let id = setup.id().to_string();
+                        let selected = self.selected_harness_id == id;
+                        div()
+                            .id(("harness-setup", index))
+                            .w_full()
+                            .px_2()
+                            .py_2()
+                            .rounded_sm()
+                            .border_l_2()
+                            .border_color(if selected { theme.accent } else { theme.border })
+                            .bg(if selected {
+                                theme.raised
+                            } else {
+                                theme.surface
+                            })
+                            .hover(|style| style.bg(theme.raised).cursor_pointer())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |workspace, _, _, cx| {
+                                    workspace.select_harness(&id.clone(), cx)
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(theme.text)
+                                    .child(setup.name().to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.faint)
+                                    .child(format!(
+                                        "{} tools · {} max steps",
+                                        setup.enabled_tools().len(),
+                                        setup.max_steps()
+                                    )),
+                            )
+                    }),
+            )
             .child(self.search_input.clone())
             .child(self.rename_input.clone())
             .child(
@@ -1114,11 +1360,15 @@ impl Workspace {
                             .text_size(px(11.))
                             .text_color(theme.faint)
                             .child(format!(
-                                "{} · {} · {} events{}",
+                                "{} · {} · {} · {} events{}",
                                 self.spaces_config
                                     .get(summary.space_id.as_deref().unwrap_or_default())
                                     .map(|space| space.name())
                                     .unwrap_or("Local harness"),
+                                self.harness_setups
+                                    .get(summary.harness_id.as_deref().unwrap_or_default())
+                                    .map(|setup| setup.name())
+                                    .unwrap_or("Standard"),
                                 summary.model.as_deref().unwrap_or("no model"),
                                 summary.event_count,
                                 if summary.turn_active {
@@ -1496,6 +1746,13 @@ impl Workspace {
             .and_then(|view| view.model.clone())
             .unwrap_or_else(|| "unknown".into());
         let event_count = view.as_ref().map_or(0, |view| view.event_count);
+        let harness = self.selected_harness();
+        let harness_name = harness.name().to_string();
+        let harness_detail = format!(
+            "{} tools · {} max steps",
+            harness.enabled_tools().len(),
+            harness.max_steps()
+        );
         let prompt = view
             .as_ref()
             .and_then(|view| view.system_prompt.clone())
@@ -1632,6 +1889,35 @@ impl Workspace {
                                             .text_size(px(11.))
                                             .text_color(theme.muted)
                                             .child(model),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(theme.faint)
+                                            .child("Setup"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .items_end()
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(theme.muted)
+                                                    .child(harness_name),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(theme.faint)
+                                                    .child(harness_detail),
+                                            ),
                                     ),
                             )
                             .child(
@@ -1851,6 +2137,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_context))
             .on_action(cx.listener(Self::next_space))
             .on_action(cx.listener(Self::previous_space))
+            .on_action(cx.listener(Self::next_harness))
+            .on_action(cx.listener(Self::previous_harness))
             .when(sidebar_visible, |el| el.child(self.render_sidebar(cx)))
             .child(
                 div()
@@ -1979,6 +2267,7 @@ impl Render for Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::harness::HarnessSetupsConfig;
     use harness_core::spaces::SpacesConfig;
     use harness_core::tools::ToolInvocation;
 
@@ -1988,7 +2277,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("hello.txt"), "selected root").unwrap();
 
-        let tools = Workspace::build_tools(home.path(), root.path());
+        let setups = HarnessSetupsConfig::default();
+        let harness = setups.get("standard").unwrap();
+        let tools = Workspace::build_tools(home.path(), root.path(), harness);
         let output = futures::executor::block_on(tools.execute(ToolInvocation {
             call_id: "test".into(),
             name: "read_file".into(),
@@ -2063,5 +2354,119 @@ mod tests {
             Some("local".to_string())
         );
         assert_eq!(Workspace::cycled_space_id(&config, "missing", false), None);
+    }
+
+    #[test]
+    fn build_tools_respects_the_harness_setup_allowlist() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("hello.txt"), "setup root").unwrap();
+        let setups = HarnessSetupsConfig::parse(
+            r#"{"setups":[{"id":"research","name":"Research","system_prompt":{"include_harness_identity":true,"persona":"Read only."},"enabled_tools":["read_file"],"max_steps":4}]}"#,
+        )
+        .unwrap();
+        let setup = setups.get("research").unwrap();
+
+        let tools = Workspace::build_tools(home.path(), root.path(), setup);
+        let names = tools
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["read_file"]);
+    }
+
+    #[test]
+    fn harness_setups_load_fails_closed_to_defaults() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("harness-setups.json");
+        let defaults = HarnessSetupsConfig::default();
+
+        let (loaded, error) = Workspace::load_harness_setups(&path);
+        assert_eq!(loaded, defaults);
+        assert!(error.is_none());
+
+        std::fs::write(&path, "{invalid").unwrap();
+        let (fallback, error) = Workspace::load_harness_setups(&path);
+        assert_eq!(fallback, defaults);
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn first_launch_persists_a_customized_global_prompt_into_setups() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("harness-setups.json");
+        let prompt = SystemPromptConfig {
+            include_harness_identity: false,
+            persona: "Legacy local persona.".into(),
+        };
+
+        let (loaded, error) = Workspace::prepare_harness_setups(
+            &path,
+            false,
+            HarnessSetupsConfig::default(),
+            prompt.clone(),
+        );
+
+        assert!(error.is_none());
+        assert_eq!(loaded.get("standard").unwrap().system_prompt(), &prompt);
+        assert_eq!(HarnessSetupsConfig::load(&path).unwrap(), loaded);
+    }
+
+    #[test]
+    fn existing_setup_files_own_their_standard_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("harness-setups.json");
+        let setups = HarnessSetupsConfig::default();
+        setups.save(&path).unwrap();
+        let legacy = SystemPromptConfig {
+            include_harness_identity: false,
+            persona: "Legacy local persona.".into(),
+        };
+
+        let (loaded, error) =
+            Workspace::prepare_harness_setups(&path, true, setups.clone(), legacy);
+
+        assert!(error.is_none());
+        assert_eq!(loaded, setups);
+    }
+
+    #[test]
+    fn harness_references_resolve_safely() {
+        let config = HarnessSetupsConfig::default();
+        let standard = config.get("standard").unwrap().id().to_string();
+        let research = config.get("research").unwrap().id().to_string();
+
+        assert_eq!(
+            Workspace::resolve_harness_id(&config, Some(&research)),
+            research
+        );
+        assert_eq!(Workspace::resolve_harness_id(&config, None), standard);
+        assert_eq!(
+            Workspace::resolve_harness_id(&config, Some("missing")),
+            standard
+        );
+    }
+
+    #[test]
+    fn harness_selection_cycles_forward_and_backward() {
+        let config = HarnessSetupsConfig::default();
+        let standard = config.get("standard").unwrap().id().to_string();
+        let research = config.get("research").unwrap().id().to_string();
+        let minimal = config.get("minimal").unwrap().id().to_string();
+
+        assert_eq!(
+            Workspace::cycled_harness_id(&config, &standard, true),
+            Some(research)
+        );
+        assert_eq!(
+            Workspace::cycled_harness_id(&config, &minimal, true),
+            Some(standard.clone())
+        );
+        assert_eq!(
+            Workspace::cycled_harness_id(&config, &standard, false),
+            Some(minimal)
+        );
+        assert_eq!(Workspace::cycled_harness_id(&config, "missing", true), None);
     }
 }

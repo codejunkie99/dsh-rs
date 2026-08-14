@@ -11,6 +11,8 @@ pub enum EventKind {
         model: Option<String>,
         #[serde(default)]
         space_id: Option<String>,
+        #[serde(default)]
+        harness_id: Option<String>,
     },
     SessionTitleChanged {
         title: String,
@@ -20,6 +22,9 @@ pub enum EventKind {
     },
     SessionSpaceChanged {
         space_id: String,
+    },
+    SessionHarnessChanged {
+        harness_id: String,
     },
     SystemPromptSnapshot {
         content: Option<String>,
