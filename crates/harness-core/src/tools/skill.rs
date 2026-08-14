@@ -107,6 +107,42 @@ pub fn render_skill_catalog(entries: &[SkillCatalogEntry]) -> String {
     lines.join("\n")
 }
 
+pub fn render_skill_catalog_update(entries: &[SkillCatalogEntry]) -> String {
+    let availability: &[&str] = if entries.is_empty() {
+        &[
+            "No skills are currently available through the `skill` tool. Do not use names from earlier skill catalogs.",
+            "A user may still invoke a skill directly; its <skill_content> block then appears in this conversation. Follow it, and do not call the `skill` tool for it.",
+        ]
+    } else {
+        &[
+            "Use only names in this replacement catalog. If the user names a listed skill, or the task clearly matches its description, call the `skill` tool with the exact skill name before acting.",
+            "A user may also invoke a skill directly; its <skill_content> block then appears in this conversation. Follow it, and do not call the `skill` tool again for that skill.",
+        ]
+    };
+
+    let mut lines = vec![
+        "<system-reminder>".to_string(),
+        "The available skill catalog changed. This complete catalog replaces every earlier available-skills list in this session:".to_string(),
+        String::new(),
+        "<available_skills>".to_string(),
+    ];
+    lines.extend(entries.iter().map(|entry| {
+        format!(
+            "- `{}`: {}",
+            entry.name,
+            escape_catalog_text(&entry.description)
+        )
+    }));
+    lines.extend([
+        "</available_skills>".to_string(),
+        String::new(),
+        availability[0].to_string(),
+        availability[1].to_string(),
+        "</system-reminder>".to_string(),
+    ]);
+    lines.join("\n")
+}
+
 fn catalog_description(value: &str) -> String {
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.chars().count() <= CATALOG_DESCRIPTION_MAX_LENGTH {

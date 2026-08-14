@@ -4,7 +4,7 @@ use crate::events::{EventKind, TurnCompletionReason, Usage};
 use crate::llm::{ChatMessage, LlmAdapter, LlmRequest, StreamFrame, ToolCallRequest};
 use crate::session::SessionLog;
 use crate::skills::is_skill_name;
-use crate::tools::skill::render_skill_catalog;
+use crate::tools::skill::{render_skill_catalog, render_skill_catalog_update};
 use crate::tools::{SkillTool, ToolInvocation, ToolRegistry};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -307,15 +307,31 @@ impl AgentLoop {
         }
 
         let entries = skill_tool.catalog_entries().await?;
-        let already_published = log
-            .events()
-            .iter()
-            .any(|event| matches!(event.kind, EventKind::SkillCatalogPublished { .. }));
-        if !entries.is_empty() && !already_published {
-            log.append(EventKind::SkillCatalogPublished {
-                content: render_skill_catalog(&entries),
-                entries,
-            })?;
+        let latest_published = log.events().iter().rev().find_map(|event| {
+            if let EventKind::SkillCatalogPublished { entries, .. } = &event.kind {
+                Some(entries.clone())
+            } else {
+                None
+            }
+        });
+
+        match latest_published {
+            Some(previous) if previous == entries => {}
+            Some(_) => {
+                log.append(EventKind::SkillCatalogPublished {
+                    content: render_skill_catalog_update(&entries),
+                    entries,
+                    update: true,
+                })?;
+            }
+            None if !entries.is_empty() => {
+                log.append(EventKind::SkillCatalogPublished {
+                    content: render_skill_catalog(&entries),
+                    entries,
+                    update: false,
+                })?;
+            }
+            None => {}
         }
 
         for name in invoked_skill_names(input) {
@@ -350,6 +366,11 @@ impl AgentLoop {
 
     fn derive_model_history(events: &[crate::events::SessionEvent]) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
+        let latest_catalog_seq = events
+            .iter()
+            .rev()
+            .find(|event| matches!(event.kind, EventKind::SkillCatalogPublished { .. }))
+            .map(|event| event.seq);
         if let Some(content) = events
             .iter()
             .rev()
@@ -365,6 +386,11 @@ impl AgentLoop {
             messages.push(ChatMessage::System { content });
         }
         for event in events {
+            if matches!(event.kind, EventKind::SkillCatalogPublished { .. })
+                && latest_catalog_seq != Some(event.seq)
+            {
+                continue;
+            }
             match &event.kind {
                 EventKind::UserMessage { content, .. } => messages.push(ChatMessage::User {
                     content: content.clone(),

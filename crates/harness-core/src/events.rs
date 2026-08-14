@@ -70,6 +70,8 @@ pub enum EventKind {
     SkillCatalogPublished {
         entries: Vec<SkillCatalogEntry>,
         content: String,
+        #[serde(default)]
+        update: bool,
     },
     SkillInvocationInjected {
         name: String,
@@ -207,5 +209,35 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let decoded: SessionEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn old_skill_catalog_events_decode_as_first_publications() {
+        let event: SessionEvent = serde_json::from_str(
+            r#"{
+                "seq": 3,
+                "id": "0f6a7cd1-58a7-4f8f-9f16-c9fdd73dbbb0",
+                "session_id": "6c1d65e3-51bf-48b7-a1a7-f6f2c34cd656",
+                "timestamp": "2026-08-14T00:00:00Z",
+                "type": "skill_catalog_published",
+                "data": {
+                    "entries": [{"name": "old-skill", "description": "Old skill"}],
+                    "content": "old catalog"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            event.kind,
+            EventKind::SkillCatalogPublished {
+                entries: vec![SkillCatalogEntry {
+                    name: "old-skill".into(),
+                    description: "Old skill".into(),
+                }],
+                content: "old catalog".into(),
+                update: false,
+            }
+        );
     }
 }
