@@ -2,6 +2,7 @@ use crate::events::EventKind;
 use crate::session::{SessionLog, SessionView, SharedSessionLog};
 use anyhow::Result;
 use parking_lot::RwLock;
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -13,6 +14,20 @@ pub struct SessionSummary {
     pub event_count: u64,
     pub turn_active: bool,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchField {
+    Title,
+    Transcript,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SearchResult {
+    pub session_id: Uuid,
+    pub title: String,
+    pub match_field: SearchField,
 }
 
 #[derive(Debug, Default)]
@@ -85,6 +100,118 @@ impl SessionStore {
         Ok(log)
     }
 
+    pub fn rename(&self, id: Uuid, title: impl Into<String>) -> Result<SharedSessionLog> {
+        let log = self
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("session {id} does not exist"))?;
+        log.set_title(title)?;
+        Ok(log)
+    }
+
+    pub fn fork(
+        &self,
+        source_id: Uuid,
+        boundary_seq: Option<u64>,
+        title: impl Into<String>,
+    ) -> Result<SharedSessionLog> {
+        let source = self
+            .get(source_id)
+            .ok_or_else(|| anyhow::anyhow!("source session {source_id} does not exist"))?;
+        let events = source.events();
+        let boundary =
+            boundary_seq.unwrap_or_else(|| events.last().map(|event| event.seq).unwrap_or(0));
+        if boundary == 0 {
+            anyhow::bail!("cannot fork an empty session");
+        }
+        if !events.iter().any(|event| event.seq == boundary) {
+            anyhow::bail!("fork boundary {boundary} does not exist");
+        }
+
+        let id = Uuid::new_v4();
+        let path = self.root.join(format!("{id}.jsonl"));
+        let fork = SharedSessionLog::new(SessionLog::with_path(id, Some(path)));
+        for event in events.iter().take_while(|event| event.seq <= boundary) {
+            fork.append_with_metadata(event.kind.clone(), event.metadata.clone())?;
+        }
+        fork.set_title(title)?;
+        self.logs.write().push(fork.clone());
+        Ok(fork)
+    }
+
+    pub fn search(&self, query: &str) -> Vec<SearchResult> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let query = query.to_lowercase();
+        let mut results = Vec::new();
+        for log in self.logs.read().iter() {
+            let view = log.view();
+            if view.title.to_lowercase().contains(&query) {
+                results.push(SearchResult {
+                    session_id: view.id,
+                    title: view.title.clone(),
+                    match_field: SearchField::Title,
+                });
+                continue;
+            }
+            if view.transcript.iter().any(|entry| match entry {
+                crate::session::TranscriptEntry::User { content, .. }
+                | crate::session::TranscriptEntry::Assistant { content, .. }
+                | crate::session::TranscriptEntry::System { message: content } => {
+                    content.to_lowercase().contains(&query)
+                }
+                crate::session::TranscriptEntry::ToolCall { name, .. } => {
+                    name.to_lowercase().contains(&query)
+                }
+                crate::session::TranscriptEntry::ToolResult { output, .. } => {
+                    output.to_lowercase().contains(&query)
+                }
+            }) {
+                results.push(SearchResult {
+                    session_id: view.id,
+                    title: view.title.clone(),
+                    match_field: SearchField::Transcript,
+                });
+            }
+        }
+        results
+    }
+
+    pub fn export_markdown(&self, id: Uuid) -> Result<String> {
+        let log = self
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("session {id} does not exist"))?;
+        let view = log.view();
+        let mut markdown = format!(
+            "# {}\n\nModel: `{}`\n\n",
+            view.title,
+            view.model.as_deref().unwrap_or("unknown")
+        );
+        for entry in &view.transcript {
+            match entry {
+                crate::session::TranscriptEntry::User { content, .. } => {
+                    markdown.push_str(&format!("## User\n\n{content}\n\n"));
+                }
+                crate::session::TranscriptEntry::Assistant { content, .. } => {
+                    markdown.push_str(&format!("## Assistant\n\n{content}\n\n"));
+                }
+                crate::session::TranscriptEntry::ToolCall {
+                    name, arguments, ..
+                } => {
+                    markdown.push_str(&format!("## Tool Call\n\n`{name}` `{arguments}`\n\n"));
+                }
+                crate::session::TranscriptEntry::ToolResult { output, .. } => {
+                    markdown.push_str(&format!("## Tool Result\n\n{output}\n\n"));
+                }
+                crate::session::TranscriptEntry::System { message } => {
+                    markdown.push_str(&format!("## System\n\n{message}\n\n"));
+                }
+            }
+        }
+        Ok(markdown)
+    }
+
     fn summary(view: &SessionView) -> SessionSummary {
         SessionSummary {
             id: view.id,
@@ -141,5 +268,102 @@ mod tests {
         assert_eq!(store.list().len(), 1);
         assert_eq!(store.load_errors().len(), 1);
         assert!(store.load_errors()[0].contains(&corrupt_id.to_string()));
+    }
+
+    #[test]
+    fn renames_forks_at_boundary_and_reopens_the_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let source = store.create("Source", Some("local-null".into())).unwrap();
+        source
+            .append(EventKind::UserMessage {
+                id: Uuid::new_v4(),
+                content: "before fork".into(),
+            })
+            .unwrap();
+        source.set_title("Renamed source").unwrap();
+        source
+            .append(EventKind::UserMessage {
+                id: Uuid::new_v4(),
+                content: "after boundary".into(),
+            })
+            .unwrap();
+        let boundary = source.events()[2].seq;
+
+        let fork = store.fork(source.id(), Some(boundary), "My fork").unwrap();
+        assert_eq!(source.view().title, "Renamed source");
+        assert_eq!(fork.view().title, "My fork");
+        assert_eq!(fork.len(), 4);
+        assert_eq!(fork.view().transcript.len(), 1);
+        assert!(matches!(
+            &fork.view().transcript[0],
+            crate::session::TranscriptEntry::User { content, .. } if content == "before fork"
+        ));
+
+        let reopened = SessionStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.list().len(), 2);
+        assert!(reopened
+            .list()
+            .iter()
+            .any(|summary| summary.title == "My fork"));
+    }
+
+    #[test]
+    fn searches_titles_and_transcripts_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let first = store.create("Release planning", None).unwrap();
+        first
+            .append(EventKind::UserMessage {
+                id: Uuid::new_v4(),
+                content: "Ship the GPUI app".into(),
+            })
+            .unwrap();
+        let second = store.create("Unrelated", None).unwrap();
+        second
+            .append(EventKind::UserMessage {
+                id: Uuid::new_v4(),
+                content: "Different topic".into(),
+            })
+            .unwrap();
+
+        let results = store.search("gpui");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session_id, first.id());
+        assert_eq!(results[0].title, "Release planning");
+        assert_eq!(results[0].match_field, SearchField::Transcript);
+
+        let results = store.search("release");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].match_field, SearchField::Title);
+    }
+
+    #[test]
+    fn exports_a_session_as_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let log = store
+            .create("Export session", Some("local-null".into()))
+            .unwrap();
+        log.append(EventKind::UserMessage {
+            id: Uuid::new_v4(),
+            content: "hello export".into(),
+        })
+        .unwrap();
+        log.append(EventKind::AssistantMessage {
+            id: Uuid::new_v4(),
+            content: "exported".into(),
+            stop_reason: None,
+            usage: None,
+        })
+        .unwrap();
+
+        let markdown = store.export_markdown(log.id()).unwrap();
+        assert!(markdown.starts_with("# Export session"));
+        assert!(markdown.contains("Model: `local-null`"));
+        assert!(markdown.contains("## User"));
+        assert!(markdown.contains("hello export"));
+        assert!(markdown.contains("## Assistant"));
+        assert!(markdown.contains("exported"));
     }
 }

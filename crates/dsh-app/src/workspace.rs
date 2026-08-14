@@ -189,6 +189,60 @@ impl Workspace {
         cx.notify();
     }
 
+    fn fork_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.selected.clone() else {
+            self.status = SharedString::from("No session to fork.");
+            cx.notify();
+            return;
+        };
+        if self.busy {
+            self.status = SharedString::from("Wait for the current turn to finish.");
+            cx.notify();
+            return;
+        }
+        let title = format!("Fork of {}", source.view().title);
+        match self.store.fork(source.id(), None, title) {
+            Ok(fork) => {
+                self.selected = Some(fork);
+                self.status = SharedString::from("Session forked.");
+                self.refresh();
+            }
+            Err(error) => self.status = SharedString::from(format!("Could not fork: {error}")),
+        }
+        cx.notify();
+    }
+
+    fn export_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.selected.clone() else {
+            self.status = SharedString::from("No session to export.");
+            cx.notify();
+            return;
+        };
+        let export_dir = self
+            .store
+            .root()
+            .parent()
+            .map(|root| root.join("exports"))
+            .unwrap_or_else(|| std::path::PathBuf::from("exports"));
+        match self.store.export_markdown(source.id()) {
+            Ok(markdown) => {
+                let path = export_dir.join(format!("{}.md", source.id()));
+                match std::fs::create_dir_all(&export_dir)
+                    .and_then(|()| std::fs::write(&path, markdown))
+                {
+                    Ok(()) => {
+                        self.status = SharedString::from(format!("Exported {}.", path.display()))
+                    }
+                    Err(error) => {
+                        self.status = SharedString::from(format!("Export failed: {error}"))
+                    }
+                }
+            }
+            Err(error) => self.status = SharedString::from(format!("Export failed: {error}")),
+        }
+        cx.notify();
+    }
+
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
@@ -342,6 +396,49 @@ impl Workspace {
                                 cx.listener(|workspace, _, _, cx| workspace.create_session(cx)),
                             )
                             .child("New"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("fork-session")
+                            .flex_1()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x242b34))
+                            .text_size(px(12.))
+                            .text_color(rgb(0xdce9ff))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|style| style.bg(rgb(0x2f3944)).cursor_pointer())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, _, cx| workspace.fork_selected(cx)),
+                            )
+                            .child("Fork"),
+                    )
+                    .child(
+                        div()
+                            .id("export-session")
+                            .flex_1()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x242b34))
+                            .text_size(px(12.))
+                            .text_color(rgb(0xd8f5e4))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|style| style.bg(rgb(0x2f3944)).cursor_pointer())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, _, cx| workspace.export_selected(cx)),
+                            )
+                            .child("Export"),
                     ),
             )
             .children(self.summaries.iter().map(|summary| {

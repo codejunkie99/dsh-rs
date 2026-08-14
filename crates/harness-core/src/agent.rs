@@ -71,6 +71,11 @@ impl AgentLoop {
             id: Uuid::new_v4(),
             content: input,
         })?;
+        if log.view().title == "New session" {
+            if let Some(title) = Self::automatic_title(&log.events()) {
+                log.set_title(title)?;
+            }
+        }
 
         let mut completion = TurnCompletionReason::Natural;
 
@@ -265,6 +270,28 @@ impl AgentLoop {
         Ok(())
     }
 
+    fn automatic_title(events: &[crate::events::SessionEvent]) -> Option<String> {
+        let input = events.iter().rev().find_map(|event| {
+            if let EventKind::UserMessage { content, .. } = &event.kind {
+                Some(content.clone())
+            } else {
+                None
+            }
+        })?;
+        let normalized = input.trim();
+        if normalized.is_empty() {
+            return None;
+        }
+        if normalized.chars().count() <= 40 {
+            Some(normalized.to_string())
+        } else {
+            Some(format!(
+                "{}…",
+                normalized.chars().take(40).collect::<String>()
+            ))
+        }
+    }
+
     fn derive_model_history(events: &[crate::events::SessionEvent]) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
         for event in events {
@@ -332,6 +359,7 @@ mod tests {
         tools.register(Arc::new(EchoTool));
         let loop_ = AgentLoop::new(Arc::new(NullAdapter), Arc::new(tools));
         loop_.run_turn(log.clone(), "hello".into()).await.unwrap();
+        assert_eq!(log.view().title, "hello");
 
         let events = log.events();
         let kinds: Vec<&str> = events
@@ -351,6 +379,24 @@ mod tests {
         assert!(kinds.contains(&"user_message"));
         assert!(kinds.contains(&"assistant_message"));
         assert!(kinds.contains(&"turn_completed"));
+    }
+
+    #[tokio::test]
+    async fn first_user_message_becomes_a_bounded_automatic_title() {
+        let log = Arc::new(SessionLog::in_memory(Uuid::new_v4()));
+        let loop_ = AgentLoop::new(Arc::new(NullAdapter), Arc::new(ToolRegistry::new()));
+        loop_
+            .run_turn(
+                log.clone(),
+                "  This is a long first message that should become a bounded title  ".into(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            log.view().title,
+            "This is a long first message that should…"
+        );
     }
 
     #[test]
