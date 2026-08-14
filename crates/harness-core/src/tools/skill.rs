@@ -1,5 +1,5 @@
-pub use crate::skills::SkillCatalogEntry;
 use crate::skills::{is_skill_name, render_skill_content, SkillLookupOptions, SkillRegistry};
+pub use crate::skills::{SkillCatalogEntry, SkillSlashEntry};
 use crate::tools::{Tool, ToolInvocation, ToolOutput, ToolSpec};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -37,6 +37,24 @@ impl SkillTool {
             .map(|skill| SkillCatalogEntry {
                 name: skill.name,
                 description: catalog_description(&skill.description),
+            })
+            .collect())
+    }
+
+    pub async fn slash_entries(&self) -> Result<Vec<SkillSlashEntry>> {
+        let options = SkillLookupOptions {
+            cwd: self.cwd.clone(),
+        };
+        Ok(self
+            .skills
+            .list(&options)
+            .await?
+            .into_iter()
+            .filter(|skill| skill.invocation.user_invocable)
+            .map(|skill| SkillSlashEntry {
+                name: skill.name,
+                description: skill.description,
+                model_invocable: skill.invocation.model_invocable,
             })
             .collect())
     }

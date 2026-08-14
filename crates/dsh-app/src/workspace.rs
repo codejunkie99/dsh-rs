@@ -12,6 +12,7 @@ use crate::motion;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::providers::{ProvidersEvent, ProvidersPage};
 use crate::settings::{UiSettings, RIGHT_PANE_DEFAULT, SIDEBAR_DEFAULT, TERMINAL_DEFAULT_HEIGHT};
+use crate::skill_picker::{entry_replacement, SkillPickerState};
 use crate::terminal::{
     parse_argv, run_command, terminal_panel_bg, TerminalEntry, TerminalHistory,
     TERMINAL_TAB_BAR_HEIGHT, TERMINAL_TAB_WIDTH,
@@ -190,6 +191,10 @@ pub struct Workspace {
     credential_file_configured: bool,
     tools: Arc<ToolRegistry>,
     skill_tool: Option<Arc<SkillTool>>,
+    skill_picker: SkillPickerState,
+    skill_picker_loading: bool,
+    skill_picker_error: Option<SharedString>,
+    skill_picker_cache_key: Option<String>,
     terminal_tool: Option<Arc<CommandTool>>,
     approver: Arc<dyn ToolApprover>,
     changes: WorkspaceChangesState,
@@ -606,6 +611,10 @@ impl Workspace {
             credential_file_configured,
             tools,
             skill_tool,
+            skill_picker: SkillPickerState::default(),
+            skill_picker_loading: false,
+            skill_picker_error: None,
+            skill_picker_cache_key: None,
             terminal_tool,
             approver,
             changes: WorkspaceChangesState::NotRepository,
@@ -648,6 +657,7 @@ impl Workspace {
             }
         })
         .detach();
+        workspace.load_skill_picker(cx);
         workspace.refresh();
         workspace.refresh_changes(cx);
         if workspace.selected.is_none() {
@@ -1047,6 +1057,125 @@ impl Workspace {
         self.selected_view = self.selected.as_ref().map(|log| log.view());
     }
 
+    fn skill_picker_cache_key(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.selected_space_id,
+            self.selected_harness_id,
+            self.workspace_root.display()
+        )
+    }
+
+    fn load_skill_picker(&mut self, cx: &mut Context<Self>) {
+        let cache_key = self.skill_picker_cache_key();
+        if self.skill_picker_cache_key.as_deref() == Some(cache_key.as_str()) {
+            return;
+        }
+
+        self.skill_picker_cache_key = Some(cache_key.clone());
+        self.skill_picker = SkillPickerState::default();
+        self.skill_picker_error = None;
+        let Some(skill_tool) = self.skill_tool.clone() else {
+            self.skill_picker_loading = false;
+            self.sync_skill_picker(cx);
+            cx.notify();
+            return;
+        };
+
+        self.skill_picker_loading = true;
+        let workspace_handle = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    runtime.block_on(skill_tool.slash_entries())
+                })
+                .await;
+
+            cx.update(|cx| {
+                workspace_handle.update(cx, |workspace, cx| {
+                    if workspace.skill_picker_cache_key.as_deref() != Some(cache_key.as_str()) {
+                        return;
+                    }
+                    workspace.skill_picker_loading = false;
+                    match result {
+                        Ok(entries) => {
+                            workspace
+                                .skill_picker
+                                .set_catalog(entries.into_iter().map(Into::into).collect());
+                        }
+                        Err(error) => {
+                            workspace.skill_picker_error = Some(SharedString::from(format!(
+                                "Could not load skills: {error}"
+                            )));
+                        }
+                    }
+                    workspace.sync_skill_picker(cx);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+        self.sync_skill_picker(cx);
+        cx.notify();
+    }
+
+    fn sync_skill_picker(&mut self, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text();
+        let cursor = self.input.read(cx).cursor_offset();
+        self.skill_picker.update(&text, cursor);
+    }
+
+    fn handle_skill_picker_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.sync_skill_picker(cx);
+        if !self.skill_picker.is_open() {
+            return false;
+        }
+
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                self.dismiss_skill_picker(cx);
+                true
+            }
+            "up" if self.skill_picker.filtered_len() > 0 => {
+                self.skill_picker.move_active(-1);
+                true
+            }
+            "down" if self.skill_picker.filtered_len() > 0 => {
+                self.skill_picker.move_active(1);
+                true
+            }
+            "enter" | "return" if self.skill_picker.selected_name().is_some() => {
+                self.accept_skill_picker(cx)
+            }
+            _ => false,
+        }
+    }
+
+    fn dismiss_skill_picker(&mut self, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text();
+        self.skill_picker.dismiss(&text);
+        cx.notify();
+    }
+
+    fn accept_skill_picker(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((token, name)) = self.skill_picker.accept() else {
+            return false;
+        };
+        let replacement = entry_replacement(&name);
+        self.input.update(cx, |input, cx| {
+            input.replace_plain_token(token.range, &replacement, cx);
+        });
+        cx.notify();
+        true
+    }
+
     fn refresh_changes(&mut self, cx: &mut Context<Self>) {
         if self.changes_scanning {
             return;
@@ -1148,7 +1277,7 @@ impl Workspace {
             self.status = SharedString::from("Wait for the current turn to finish.");
         } else if let Some(log) = self.store.get(id) {
             self.selected = Some(log);
-            self.activate_configuration_for_selection();
+            self.activate_configuration_for_selection(cx);
             self.refresh_changes(cx);
             self.status = SharedString::from("Session loaded.");
             self.refresh();
@@ -1159,7 +1288,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn activate_configuration_for_selection(&mut self) {
+    fn activate_configuration_for_selection(&mut self, cx: &mut Context<Self>) {
         let Some(view) = self.selected.as_ref().map(|log| log.view()) else {
             return;
         };
@@ -1173,6 +1302,7 @@ impl Workspace {
                 Self::build_tools_with_skills(&self.home, &self.workspace_root, &harness);
             self.tools = tools;
             self.skill_tool = skill_tool;
+            self.load_skill_picker(cx);
             self.terminal_tool = Self::build_terminal_tool(&self.home, &self.workspace_root);
             if let Err(error) = self.reload_model() {
                 self.status = SharedString::from(format!(
@@ -1204,6 +1334,7 @@ impl Workspace {
             Self::build_tools_with_skills(&self.home, &self.workspace_root, &harness);
         self.tools = tools;
         self.skill_tool = skill_tool;
+        self.load_skill_picker(cx);
         self.terminal_tool = Self::build_terminal_tool(&self.home, &self.workspace_root);
         if let Err(error) = self.reload_model() {
             self.status = SharedString::from(format!("Could not activate space: {error}"));
@@ -1374,6 +1505,7 @@ impl Workspace {
             Self::build_tools_with_skills(&self.home, &self.workspace_root, &harness);
         self.tools = tools;
         self.skill_tool = skill_tool;
+        self.load_skill_picker(cx);
         if let Err(error) = self.reload_model() {
             self.status = SharedString::from(format!("Could not activate setup: {error}"));
             cx.notify();
@@ -2093,6 +2225,154 @@ impl Workspace {
                 )
             })
             .into_any_element()
+    }
+
+    fn render_skill_picker(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.skill_picker.is_open() {
+            return None;
+        }
+
+        let has_matches = self.skill_picker.filtered_entries().next().is_some();
+        let mut card = div()
+            .id("skill-picker-card")
+            .w(px(380.0))
+            .max_h(px(280.0))
+            .overflow_hidden()
+            .border_1()
+            .border_color(theme::hairline(0.10))
+            .rounded(px(12.0))
+            .shadow_lg()
+            .p(px(4.0))
+            .text_size(px(13.0))
+            .text_color(theme.text)
+            .bg(theme.glass_overlay())
+            .on_mouse_down_out(cx.listener(|workspace, _, _, cx| {
+                workspace.dismiss_skill_picker(cx);
+            }));
+
+        if self.skill_picker_loading && !has_matches {
+            card = card.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child("Loading skills..."),
+            );
+        } else if let Some(error) = self.skill_picker_error.clone() {
+            card = card.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.danger)
+                    .child(error),
+            );
+        } else if !has_matches {
+            card = card.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child("No matching skills"),
+            );
+        } else {
+            for (row, entry) in self.skill_picker.filtered_entries().enumerate() {
+                let selected = self.skill_picker.is_selected(row);
+                let fade_key = SharedString::from(format!("skill-picker-row-{row}"));
+                let name: SharedString = format!("/{}", entry.name).into();
+                let description: SharedString = entry.menu_description().into();
+                let row_background = if selected {
+                    theme::glass_selected_bg()
+                } else {
+                    motion::hover_blend(&fade_key, theme.wash(0.0), theme::glass_selected_bg())
+                };
+
+                card = card.child(
+                    div()
+                        .id(("skill-picker-row", row))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .px(px(8.0))
+                        .py(px(6.0))
+                        .rounded(px(8.0))
+                        .text_size(px(13.0))
+                        .cursor_pointer()
+                        .bg(row_background)
+                        .when(!selected, |row| {
+                            row.on_hover(motion::hover_listener(fade_key.clone()))
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |workspace, _, _, cx| {
+                                workspace.skill_picker.select(row);
+                                workspace.accept_skill_picker(cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    icon(icons::SKILL)
+                                        .size(px(14.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme.text)
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .truncate()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.text_muted)
+                                        .child(description),
+                                ),
+                        ),
+                );
+            }
+        }
+
+        let floating_card = motion::menu_in(
+            "skill-picker",
+            div()
+                .occlude()
+                .pb(px(6.0))
+                .child(frost::frosted(12.0, 24.0, card)),
+        );
+        let anchored = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_0()
+            .child(
+                gpui::deferred(
+                    gpui::anchored()
+                        .anchor(gpui::Anchor::BottomLeft)
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(floating_card),
+                )
+                .priority(1),
+            )
+            .into_any_element();
+        Some(anchored)
     }
 
     fn render_todo_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -4142,6 +4422,60 @@ impl Render for Workspace {
             return self.render_settings(cx).into_any_element();
         }
         let theme = Theme::of(cx).clone();
+        self.sync_skill_picker(cx);
+        let skill_picker_popover = self.render_skill_picker(&theme, cx);
+        let send_button = div()
+            .id("send")
+            .px_4()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .bg(if self.busy {
+                theme.surface_raised
+            } else {
+                theme.accent
+            })
+            .text_size(px(13.))
+            .text_color(if self.busy {
+                theme.text_faint
+            } else {
+                theme.on_accent
+            })
+            .hover(|style| {
+                if self.busy {
+                    style
+                } else {
+                    style.cursor_pointer()
+                }
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|workspace, _, window, cx| workspace.submit(&Submit, window, cx)),
+            )
+            .child(if self.busy { "..." } else { "Send" });
+        let composer = div()
+            .relative()
+            .px_6()
+            .pb_5()
+            .pt_3()
+            .flex()
+            .gap_2()
+            .border_t_1()
+            .border_color(theme.border)
+            .on_key_down(cx.listener(|workspace, event: &gpui::KeyDownEvent, _, cx| {
+                if workspace.handle_skill_picker_key(event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                workspace.sync_skill_picker(cx);
+                cx.notify();
+            }))
+            .child(div().flex_1().child(self.input.clone()))
+            .child(send_button)
+            .when_some(skill_picker_popover, |element, popover| {
+                element.child(popover)
+            });
         let sidebar_visible = self.ui_settings.sidebar_visible;
         let context_visible = self.ui_settings.context_pane_visible;
         let terminal_visible = self.ui_settings.terminal_visible;
@@ -4192,51 +4526,7 @@ impl Render for Workspace {
                             .map(|_| self.render_approval(cx)),
                     )
                     .children(self.render_todo_panel(cx))
-                    .child(
-                        div()
-                            .px_6()
-                            .pb_5()
-                            .pt_3()
-                            .flex()
-                            .gap_2()
-                            .border_t_1()
-                            .border_color(theme.border)
-                            .child(div().flex_1().child(self.input.clone()))
-                            .child(
-                                div()
-                                    .id("send")
-                                    .px_4()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .bg(if self.busy {
-                                        theme.surface_raised
-                                    } else {
-                                        theme.accent
-                                    })
-                                    .text_size(px(13.))
-                                    .text_color(if self.busy {
-                                        theme.text_faint
-                                    } else {
-                                        theme.on_accent
-                                    })
-                                    .hover(|style| {
-                                        if self.busy {
-                                            style
-                                        } else {
-                                            style.cursor_pointer()
-                                        }
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|workspace, _, window, cx| {
-                                            workspace.submit(&Submit, window, cx)
-                                        }),
-                                    )
-                                    .child(if self.busy { "..." } else { "Send" }),
-                            ),
-                    )
+                    .child(composer)
                     .child(
                         div()
                             .px_6()

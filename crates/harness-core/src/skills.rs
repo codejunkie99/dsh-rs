@@ -46,6 +46,14 @@ pub struct SkillCatalogEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SkillSlashEntry {
+    pub name: String,
+    pub description: String,
+    pub model_invocable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SkillSummary {
     pub name: String,
     pub description: String,

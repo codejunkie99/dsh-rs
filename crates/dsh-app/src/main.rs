@@ -11,6 +11,7 @@ mod motion;
 mod motion_math;
 #[allow(dead_code)]
 mod settings;
+mod skill_picker;
 mod terminal;
 #[allow(dead_code)]
 mod theme;
