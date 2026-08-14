@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::changes::{ChangeStatus, WorkspaceChanges, WorkspaceChangesState};
 use crate::input::{ChatInput, InputKind};
 use crate::settings::UiSettings;
 use crate::theme::{Theme, CONTEXT_PANE_WIDTH, HEADER_HEIGHT, SIDEBAR_WIDTH, STATUS_HEIGHT};
@@ -50,12 +51,15 @@ pub struct Workspace {
     ui_settings: UiSettings,
     ui_settings_path: std::path::PathBuf,
     home: std::path::PathBuf,
+    workspace_root: std::path::PathBuf,
     credential_path: std::path::PathBuf,
     credential_environment_override: bool,
     credential_file_configured: bool,
     tools: Arc<ToolRegistry>,
     approver: Arc<dyn ToolApprover>,
     system_prompt: Option<String>,
+    changes: WorkspaceChangesState,
+    changes_scanning: bool,
     pending_approval: Option<ApprovalRequest>,
     cancellation: Option<TurnCancellation>,
     search_matches: Option<Vec<uuid::Uuid>>,
@@ -76,6 +80,8 @@ impl Workspace {
             .map(|key| !key.trim().is_empty())
             .unwrap_or(false);
         let credential_file_configured = CredentialStore::resolve(None, &credential_path).is_ok();
+        let workspace_root = home.join(".dsh-rs").join("workspace");
+        let _ = std::fs::create_dir_all(&workspace_root);
         let ui_settings_path = home.join(".dsh-rs").join("ui.json");
         let ui_settings = if ui_settings_path.exists() {
             UiSettings::load(&ui_settings_path).unwrap_or_else(|error| {
@@ -162,12 +168,15 @@ impl Workspace {
             ui_settings,
             ui_settings_path,
             home,
+            workspace_root,
             credential_path,
             credential_environment_override,
             credential_file_configured,
             tools,
             approver,
             system_prompt,
+            changes: WorkspaceChangesState::NotRepository,
+            changes_scanning: false,
             pending_approval: None,
             cancellation: None,
             search_matches: None,
@@ -195,6 +204,7 @@ impl Workspace {
         })
         .detach();
         workspace.refresh();
+        workspace.refresh_changes(cx);
         if workspace.selected.is_none() {
             workspace.create_session(cx);
         }
@@ -359,6 +369,28 @@ impl Workspace {
     fn refresh(&mut self) {
         self.summaries = self.store.list();
         self.selected_view = self.selected.as_ref().map(|log| log.view());
+    }
+
+    fn refresh_changes(&mut self, cx: &mut Context<Self>) {
+        if self.changes_scanning {
+            return;
+        }
+        self.changes_scanning = true;
+        let root = self.workspace_root.clone();
+        let workspace_handle = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let state = cx
+                .background_spawn(async move { WorkspaceChanges::scan_blocking(root) })
+                .await;
+            let _ = cx.update(|cx| {
+                workspace_handle.update(cx, |workspace, cx| {
+                    workspace.changes = state;
+                    workspace.changes_scanning = false;
+                    cx.notify();
+                })
+            });
+        })
+        .detach();
     }
 
     fn create_session(&mut self, cx: &mut Context<Self>) {
@@ -913,6 +945,175 @@ impl Workspace {
             }))
     }
 
+    fn render_changes_section(&self) -> gpui::Div {
+        let theme = Theme::dark();
+        let section = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .pb_3()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div().flex().items_center().justify_between().child(
+                    div()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.faint)
+                        .child("CHANGES"),
+                ),
+            );
+
+        if self.changes_scanning {
+            return section.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.faint)
+                    .child("Scanning repository"),
+            );
+        }
+
+        match &self.changes {
+            WorkspaceChangesState::NotRepository => section.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.faint)
+                    .child("No repository"),
+            ),
+            WorkspaceChangesState::Failed(error) => {
+                section.child(div().text_size(px(11.)).text_color(theme.danger).child(
+                    if error.chars().count() > 120 {
+                        format!("{}...", error.chars().take(117).collect::<String>())
+                    } else {
+                        error.clone()
+                    },
+                ))
+            }
+            WorkspaceChangesState::Ready(changes) => {
+                let branch = changes.branch.clone().unwrap_or_else(|| "detached".into());
+                let totals = format!(
+                    "{} files  up {}  down {}  +{}  -{}",
+                    changes.files.len(),
+                    changes.ahead,
+                    changes.behind,
+                    changes.total_additions.unwrap_or(0),
+                    changes.total_deletions.unwrap_or(0),
+                );
+                let visible_count = changes.files.len().min(10);
+                let hidden_count = changes.files.len().saturating_sub(visible_count);
+
+                section
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.text)
+                                    .child(branch),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.faint)
+                                    .child(totals),
+                            ),
+                    )
+                    .children(
+                        changes
+                            .files
+                            .iter()
+                            .take(10)
+                            .enumerate()
+                            .map(|(index, file)| {
+                                let (status_label, status_color) = match file.status {
+                                    ChangeStatus::Added => ("A", theme.success),
+                                    ChangeStatus::Deleted => ("D", theme.danger),
+                                    ChangeStatus::Renamed => ("R", theme.warning),
+                                    ChangeStatus::Copied => ("C", theme.warning),
+                                    ChangeStatus::TypeChanged => ("T", theme.warning),
+                                    ChangeStatus::Unmerged => ("U", theme.danger),
+                                    ChangeStatus::Untracked => ("?", theme.warning),
+                                    ChangeStatus::Modified => ("M", theme.accent),
+                                };
+                                let counts = match (file.additions, file.deletions) {
+                                    (Some(additions), Some(deletions)) => {
+                                        format!("+{additions} -{deletions}")
+                                    }
+                                    (Some(additions), None) => format!("+{additions} binary"),
+                                    (None, Some(deletions)) => format!("-{deletions} binary"),
+                                    (None, None) => "no text stats".into(),
+                                };
+                                let path = if file.path.chars().count() > 42 {
+                                    format!("{}...", file.path.chars().take(39).collect::<String>())
+                                } else {
+                                    file.path.clone()
+                                };
+                                div()
+                                    .id(("changed-file", index))
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(status_color)
+                                                    .child(status_label),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(theme.text)
+                                                    .child(path),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(if file.staged {
+                                                        theme.warning
+                                                    } else {
+                                                        theme.faint
+                                                    })
+                                                    .child(if file.staged {
+                                                        "staged"
+                                                    } else {
+                                                        "worktree"
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(theme.muted)
+                                                    .child(counts),
+                                            ),
+                                    )
+                            }),
+                    )
+                    .when(hidden_count > 0, |element| {
+                        element.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.faint)
+                                .child(format!("+{hidden_count} more files")),
+                        )
+                    })
+            }
+        }
+    }
+
     fn render_context_pane(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let theme = Theme::dark();
         let view = self.selected_view.clone();
@@ -992,6 +1193,21 @@ impl Workspace {
                     )
                     .child(
                         div()
+                            .id("refresh-changes")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .text_size(px(11.))
+                            .text_color(theme.muted)
+                            .hover(|style| style.bg(theme.raised).cursor_pointer())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, _, cx| workspace.refresh_changes(cx)),
+                            )
+                            .child("Refresh"),
+                    )
+                    .child(
+                        div()
                             .id("close-context")
                             .px_2()
                             .py_1()
@@ -1017,6 +1233,7 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap_3()
+                    .child(self.render_changes_section())
                     .child(
                         div()
                             .text_size(px(15.))

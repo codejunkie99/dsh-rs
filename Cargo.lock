@@ -1134,6 +1134,7 @@ dependencies = [
  "harness-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "unicode-segmentation",
  "uuid",
