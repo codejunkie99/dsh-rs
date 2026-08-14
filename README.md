@@ -5,6 +5,7 @@ A native Rust + GPUI desktop milestone for the DeepSeek Harness agent model. It 
 ## Current capabilities
 
 - GPU-accelerated native macOS interface built with GPUI 0.2.2.
+- Comet-inspired three-pane developer workbench: a 256 px spaces/sessions rail, center transcript and composer, and a persisted 420 px context pane.
 - Append-only, replayable JSONL session logs.
 - Automatic bounded session titles from the first user message.
 - Session sidebar with model, event count, and active-turn state.
@@ -57,6 +58,16 @@ Sessions are stored in:
 Each line is one typed session event. Delete the directory to reset local state. Corrupt files are skipped without preventing valid sessions from loading.
 
 The sidebar search field filters titles and transcript content. Enter in the rename field updates the selected session title as a durable `session_title_changed` event.
+
+## Workbench layout
+
+The native shell uses a dense dark three-pane layout adapted from the MIT-licensed Comet UI direction:
+
+- Left rail: spaces, session search, sessions, and model access.
+- Center pane: session header, transcript, tool approvals, composer, and reserved status strip.
+- Right pane: selected-session model/event/turn/prompt state plus recent tool activity.
+
+Pane visibility persists in `~/.dsh-rs/ui.json`. Press `Cmd+S` to toggle the left rail and `Cmd+B` to toggle the context pane.
 
 ## System prompt
 

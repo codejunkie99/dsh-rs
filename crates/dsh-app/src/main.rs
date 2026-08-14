@@ -1,4 +1,6 @@
 mod input;
+mod settings;
+mod theme;
 mod workspace;
 
 use gpui::{
@@ -9,7 +11,8 @@ use input::{
     Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft, SelectRight,
 };
 use workspace::{
-    CancelTurn, NewSession, RenameSession, SaveCredential, SearchSessions, Submit, Workspace,
+    CancelTurn, NewSession, RenameSession, SaveCredential, SearchSessions, Submit, ToggleContext,
+    ToggleSidebar, Workspace,
 };
 
 const APP_TITLE: &str = "DeepSeek Harness RS";
@@ -24,6 +27,8 @@ fn main() {
             KeyBinding::new("enter", SaveCredential, Some("ApiKeyInput")),
             KeyBinding::new("cmd-n", NewSession, Some("Workspace")),
             KeyBinding::new("cmd-.", CancelTurn, Some("Workspace")),
+            KeyBinding::new("cmd-s", ToggleSidebar, Some("Workspace")),
+            KeyBinding::new("cmd-b", ToggleContext, Some("Workspace")),
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("delete", Delete, None),
             KeyBinding::new("left", Left, None),
@@ -47,7 +52,7 @@ fn main() {
         .detach();
         cx.on_action(|_: &Quit, cx| cx.quit());
 
-        let bounds = Bounds::centered(None, size(px(1200.0), px(760.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);
         let window = cx
             .open_window(
                 WindowOptions {

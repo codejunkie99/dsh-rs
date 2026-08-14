@@ -1129,8 +1129,11 @@ dependencies = [
 name = "dsh-app"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gpui",
  "harness-core",
+ "serde",
+ "serde_json",
  "tokio",
  "unicode-segmentation",
  "uuid",

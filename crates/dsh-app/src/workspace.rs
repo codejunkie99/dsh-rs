@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use crate::input::{ChatInput, InputKind};
+use crate::settings::UiSettings;
+use crate::theme::{Theme, CONTEXT_PANE_WIDTH, HEADER_HEIGHT, SIDEBAR_WIDTH, STATUS_HEIGHT};
 use gpui::{
-    actions, div, prelude::*, px, rgb, Context, Entity, FontWeight, MouseButton, SharedString,
-    Window,
+    actions, div, prelude::*, px, Context, Entity, FontWeight, MouseButton, SharedString, Window,
 };
 use harness_core::agent::AgentLoop;
 use harness_core::approval::{
@@ -27,7 +28,9 @@ actions!(
         CancelTurn,
         SearchSessions,
         RenameSession,
-        SaveCredential
+        SaveCredential,
+        ToggleSidebar,
+        ToggleContext
     ]
 );
 
@@ -44,6 +47,8 @@ pub struct Workspace {
     busy: bool,
     status: SharedString,
     model: String,
+    ui_settings: UiSettings,
+    ui_settings_path: std::path::PathBuf,
     home: std::path::PathBuf,
     credential_path: std::path::PathBuf,
     credential_environment_override: bool,
@@ -71,6 +76,17 @@ impl Workspace {
             .map(|key| !key.trim().is_empty())
             .unwrap_or(false);
         let credential_file_configured = CredentialStore::resolve(None, &credential_path).is_ok();
+        let ui_settings_path = home.join(".dsh-rs").join("ui.json");
+        let ui_settings = if ui_settings_path.exists() {
+            UiSettings::load(&ui_settings_path).unwrap_or_else(|error| {
+                eprintln!("UI settings load failed ({error}); using workbench defaults");
+                UiSettings::default()
+            })
+        } else {
+            let settings = UiSettings::default();
+            let _ = settings.save(&ui_settings_path);
+            settings
+        };
         let selection =
             ModelSelection::select_from_environment(Some(&home)).unwrap_or_else(|error| {
                 eprintln!("model selection failed: {error}");
@@ -143,6 +159,8 @@ impl Workspace {
             busy: false,
             status,
             model: selection.model.clone(),
+            ui_settings,
+            ui_settings_path,
             home,
             credential_path,
             credential_environment_override,
@@ -189,6 +207,22 @@ impl Workspace {
             .unwrap_or_else(std::env::temp_dir)
             .join(".dsh-rs")
             .join("sessions")
+    }
+
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.ui_settings.sidebar_visible = !self.ui_settings.sidebar_visible;
+        if let Err(error) = self.ui_settings.save(&self.ui_settings_path) {
+            self.status = SharedString::from(format!("Could not save sidebar state: {error}"));
+        }
+        cx.notify();
+    }
+
+    fn toggle_context(&mut self, _: &ToggleContext, _: &mut Window, cx: &mut Context<Self>) {
+        self.ui_settings.context_pane_visible = !self.ui_settings.context_pane_visible;
+        if let Err(error) = self.ui_settings.save(&self.ui_settings_path) {
+            self.status = SharedString::from(format!("Could not save context state: {error}"));
+        }
+        cx.notify();
     }
 
     fn build_tools(home: &std::path::Path) -> Arc<ToolRegistry> {
@@ -566,6 +600,7 @@ impl Workspace {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let theme = Theme::dark();
         let visible_summaries: Vec<SessionSummary> = match &self.search_matches {
             Some(matches) => self
                 .summaries
@@ -578,13 +613,13 @@ impl Workspace {
 
         div()
             .id("sessions-sidebar")
-            .w(px(280.))
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x13161c))
+            .bg(theme.surface)
             .border_r_1()
-            .border_color(rgb(0x252b34))
+            .border_color(theme.border)
             .overflow_scroll()
             .p_3()
             .gap_2()
@@ -597,8 +632,8 @@ impl Workspace {
                         div()
                             .text_size(px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0x8f9aa8))
-                            .child("SESSIONS"),
+                            .text_color(theme.faint)
+                            .child("SPACES"),
                     )
                     .children(self.busy.then(|| {
                         div()
@@ -608,10 +643,10 @@ impl Workspace {
                             .items_center()
                             .justify_center()
                             .rounded_md()
-                            .bg(rgb(0x753030))
+                            .bg(theme.danger)
                             .text_size(px(13.))
-                            .text_color(rgb(0xffe8e8))
-                            .hover(|style| style.bg(rgb(0x8e3a3a)).cursor_pointer())
+                            .text_color(theme.background)
+                            .hover(|style| style.cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|workspace, _, window, cx| {
@@ -626,15 +661,36 @@ impl Workspace {
                             .px_2()
                             .py_1()
                             .rounded_sm()
-                            .bg(rgb(0x246b53))
+                            .bg(theme.accent)
                             .text_size(px(12.))
-                            .text_color(rgb(0xe8fff6))
-                            .hover(|style| style.bg(rgb(0x2d8465)).cursor_pointer())
+                            .text_color(theme.background)
+                            .hover(|style| style.bg(theme.success).cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|workspace, _, _, cx| workspace.create_session(cx)),
                             )
                             .child("New"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("local-space")
+                    .w_full()
+                    .px_2()
+                    .py_2()
+                    .rounded_sm()
+                    .bg(theme.raised)
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme.text)
+                            .child("Local harness"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.faint)
+                            .child("This Mac"),
                     ),
             )
             .child(self.search_input.clone())
@@ -649,13 +705,13 @@ impl Workspace {
                             .flex_1()
                             .py_1()
                             .rounded_sm()
-                            .bg(rgb(0x242b34))
+                            .bg(theme.raised)
                             .text_size(px(12.))
-                            .text_color(rgb(0xdce9ff))
+                            .text_color(theme.text)
                             .flex()
                             .items_center()
                             .justify_center()
-                            .hover(|style| style.bg(rgb(0x2f3944)).cursor_pointer())
+                            .hover(|style| style.bg(theme.border).cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|workspace, _, _, cx| workspace.fork_selected(cx)),
@@ -668,13 +724,13 @@ impl Workspace {
                             .flex_1()
                             .py_1()
                             .rounded_sm()
-                            .bg(rgb(0x242b34))
+                            .bg(theme.raised)
                             .text_size(px(12.))
-                            .text_color(rgb(0xd8f5e4))
+                            .text_color(theme.success)
                             .flex()
                             .items_center()
                             .justify_center()
-                            .hover(|style| style.bg(rgb(0x2f3944)).cursor_pointer())
+                            .hover(|style| style.bg(theme.border).cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|workspace, _, _, cx| workspace.export_selected(cx)),
@@ -692,7 +748,7 @@ impl Workspace {
                         div()
                             .text_size(px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0x8f9aa8))
+                            .text_color(theme.faint)
                             .child("MODEL ACCESS"),
                     )
                     .child(self.credential_input.clone())
@@ -706,13 +762,13 @@ impl Workspace {
                                     .flex_1()
                                     .py_1()
                                     .rounded_sm()
-                                    .bg(rgb(0x246b53))
+                                    .bg(theme.success)
                                     .text_size(px(12.))
-                                    .text_color(rgb(0xe8fff6))
+                                    .text_color(theme.background)
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .hover(|style| style.bg(rgb(0x2d8465)).cursor_pointer())
+                                    .hover(|style| style.bg(theme.success).cursor_pointer())
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|workspace, _, window, cx| {
@@ -728,16 +784,16 @@ impl Workspace {
                                     .py_1()
                                     .rounded_sm()
                                     .bg(if self.credential_file_configured {
-                                        rgb(0x6b2424)
+                                        theme.danger
                                     } else {
-                                        rgb(0x242b34)
+                                        theme.raised
                                     })
                                     .text_size(px(12.))
-                                    .text_color(rgb(0xffe8e8))
+                                    .text_color(theme.background)
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .hover(|style| style.bg(rgb(0x843030)).cursor_pointer())
+                                    .hover(|style| style.cursor_pointer())
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|workspace, _, _, cx| {
@@ -751,11 +807,11 @@ impl Workspace {
                         div()
                             .text_size(px(11.))
                             .text_color(if self.credential_environment_override {
-                                rgb(0xffd9a0)
+                                theme.warning
                             } else if self.credential_file_configured {
-                                rgb(0xd8f5e4)
+                                theme.success
                             } else {
-                                rgb(0x818d9a)
+                                theme.faint
                             })
                             .child(self.credential_label()),
                     ),
@@ -769,12 +825,14 @@ impl Workspace {
                     .px_2()
                     .py_2()
                     .rounded_sm()
+                    .border_l_2()
+                    .border_color(if selected { theme.accent } else { theme.border })
                     .bg(if selected {
-                        rgb(0x20262e)
+                        theme.raised
                     } else {
-                        rgb(0x171a20)
+                        theme.surface
                     })
-                    .hover(|style| style.bg(rgb(0x20262e)).cursor_pointer())
+                    .hover(|style| style.bg(theme.raised).cursor_pointer())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |workspace, _, _, cx| workspace.select(id, cx)),
@@ -782,13 +840,13 @@ impl Workspace {
                     .child(
                         div()
                             .text_size(px(13.))
-                            .text_color(rgb(0xe7e9ee))
+                            .text_color(theme.text)
                             .child(summary.title.clone()),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(0x818d9a))
+                            .text_color(theme.faint)
                             .child(format!(
                                 "{} · {} events{}",
                                 summary.model.as_deref().unwrap_or("no model"),
@@ -804,6 +862,7 @@ impl Workspace {
     }
 
     fn render_transcript(&self) -> impl IntoElement {
+        let theme = Theme::dark();
         let transcript = self
             .selected_view
             .as_ref()
@@ -820,29 +879,29 @@ impl Workspace {
             .gap_3()
             .children(transcript.iter().map(|entry| {
                 let (role, text, color) = match entry {
-                    TranscriptEntry::User { content, .. } => ("You", content, rgb(0xdce9ff)),
+                    TranscriptEntry::User { content, .. } => ("You", content, theme.text),
                     TranscriptEntry::Assistant { content, .. } => {
-                        ("Assistant", content, rgb(0xe7e9ee))
+                        ("Assistant", content, theme.text)
                     }
-                    TranscriptEntry::ToolCall { name, .. } => ("Tool call", name, rgb(0xffd9a0)),
+                    TranscriptEntry::ToolCall { name, .. } => ("Tool call", name, theme.warning),
                     TranscriptEntry::ToolResult { output, .. } => {
-                        ("Tool result", output, rgb(0xd8f5e4))
+                        ("Tool result", output, theme.success)
                     }
-                    TranscriptEntry::System { message } => ("System", message, rgb(0xffb4b4)),
+                    TranscriptEntry::System { message } => ("System", message, theme.danger),
                 };
                 div()
                     .max_w(px(820.))
                     .px_3()
                     .py_2()
                     .rounded_md()
-                    .bg(rgb(0x171a20))
+                    .bg(theme.raised)
                     .border_1()
-                    .border_color(rgb(0x252b34))
+                    .border_color(theme.border)
                     .child(
                         div()
                             .text_size(px(11.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0x818d9a))
+                            .text_color(theme.faint)
                             .child(role),
                     )
                     .child(
@@ -854,7 +913,248 @@ impl Workspace {
             }))
     }
 
+    fn render_context_pane(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let theme = Theme::dark();
+        let view = self.selected_view.clone();
+        let title = view
+            .as_ref()
+            .map(|view| view.title.clone())
+            .unwrap_or_else(|| "No session".into());
+        let model = view
+            .as_ref()
+            .and_then(|view| view.model.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let event_count = view.as_ref().map_or(0, |view| view.event_count);
+        let prompt = view
+            .as_ref()
+            .and_then(|view| view.system_prompt.clone())
+            .unwrap_or_else(|| "Default identity".into());
+        let prompt = if prompt.chars().count() > 80 {
+            format!("{}...", prompt.chars().take(77).collect::<String>())
+        } else {
+            prompt
+        };
+        let turn_state =
+            view.as_ref().map_or(
+                "idle",
+                |view| {
+                    if view.turn_active {
+                        "active"
+                    } else {
+                        "idle"
+                    }
+                },
+            );
+        let mut activity: Vec<_> = view
+            .as_ref()
+            .map(|view| {
+                view.transcript
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry,
+                            TranscriptEntry::ToolCall { .. } | TranscriptEntry::ToolResult { .. }
+                        )
+                    })
+                    .rev()
+                    .take(8)
+                    .collect()
+            })
+            .unwrap_or_default();
+        activity.reverse();
+        let activity_empty = activity.is_empty();
+
+        div()
+            .id("context-pane")
+            .w(px(CONTEXT_PANE_WIDTH))
+            .h_full()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .bg(theme.background)
+            .border_l_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .h(px(HEADER_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child("Context"),
+                    )
+                    .child(
+                        div()
+                            .id("close-context")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .text_size(px(11.))
+                            .text_color(theme.muted)
+                            .hover(|style| style.bg(theme.raised).cursor_pointer())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, window, cx| {
+                                    workspace.toggle_context(&ToggleContext, window, cx)
+                                }),
+                            )
+                            .child("Close"),
+                    ),
+            )
+            .child(
+                div()
+                    .id("context-body")
+                    .flex_1()
+                    .overflow_scroll()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(theme.faint)
+                                            .child("Model"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(theme.muted)
+                                            .child(model),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(theme.faint)
+                                            .child("Events"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(theme.muted)
+                                            .child(event_count.to_string()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(theme.faint)
+                                            .child("Turn"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(if turn_state == "active" {
+                                                theme.accent
+                                            } else {
+                                                theme.muted
+                                            })
+                                            .child(turn_state),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(theme.faint)
+                                            .child("Prompt"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(theme.muted)
+                                            .child(prompt),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.faint)
+                            .child("Recent tools"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .children(activity.into_iter().map(|entry| {
+                                let (label, value, color) = match entry {
+                                    TranscriptEntry::ToolCall { name, .. } => {
+                                        ("call", name.clone(), theme.warning)
+                                    }
+                                    TranscriptEntry::ToolResult { output, ok, .. } => (
+                                        "result",
+                                        output.clone(),
+                                        if *ok { theme.success } else { theme.danger },
+                                    ),
+                                    _ => unreachable!("activity filter permits only tool entries"),
+                                };
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .pb_2()
+                                    .border_b_1()
+                                    .border_color(theme.border)
+                                    .child(div().text_size(px(10.)).text_color(color).child(label))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(theme.muted)
+                                            .child(value),
+                                    )
+                            }))
+                            .when(activity_empty, |el| {
+                                el.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme.faint)
+                                        .child("No tool activity"),
+                                )
+                            }),
+                    ),
+            )
+    }
+
     fn render_approval(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::dark();
         let (tool_name, call_id, arguments) = self
             .pending_approval
             .as_ref()
@@ -874,9 +1174,9 @@ impl Workspace {
             .px_4()
             .py_3()
             .rounded_md()
-            .bg(rgb(0x2b2114))
+            .bg(theme.raised)
             .border_1()
-            .border_color(rgb(0x6f5220))
+            .border_color(theme.warning)
             .flex()
             .justify_between()
             .gap_3()
@@ -888,13 +1188,13 @@ impl Workspace {
                         div()
                             .text_size(px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xffd9a0))
+                            .text_color(theme.warning)
                             .child(format!("Approve {tool_name}?")),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(0xa89168))
+                            .text_color(theme.muted)
                             .child(format!("{call_id} {arguments}")),
                     ),
             )
@@ -908,10 +1208,10 @@ impl Workspace {
                             .px_3()
                             .py_1()
                             .rounded_sm()
-                            .bg(rgb(0x246b53))
+                            .bg(theme.success)
                             .text_size(px(12.))
-                            .text_color(rgb(0xe8fff6))
-                            .hover(|style| style.bg(rgb(0x2d8465)).cursor_pointer())
+                            .text_color(theme.background)
+                            .hover(|style| style.bg(theme.success).cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|workspace, _, _, cx| {
@@ -926,10 +1226,10 @@ impl Workspace {
                             .px_3()
                             .py_1()
                             .rounded_sm()
-                            .bg(rgb(0x753030))
+                            .bg(theme.danger)
                             .text_size(px(12.))
-                            .text_color(rgb(0xffe8e8))
-                            .hover(|style| style.bg(rgb(0x8e3a3a)).cursor_pointer())
+                            .text_color(theme.background)
+                            .hover(|style| style.cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|workspace, _, _, cx| {
@@ -944,25 +1244,82 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::dark();
+        let sidebar_visible = self.ui_settings.sidebar_visible;
+        let context_visible = self.ui_settings.context_pane_visible;
         div()
             .key_context("Workspace")
             .id("workspace-root")
             .size_full()
             .flex()
-            .bg(rgb(0x0f1115))
-            .text_color(rgb(0xe7e9ee))
+            .bg(theme.background)
+            .text_color(theme.text)
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::search_sessions))
             .on_action(cx.listener(Self::rename_selected))
             .on_action(cx.listener(|workspace, _: &NewSession, _, cx| workspace.create_session(cx)))
             .on_action(cx.listener(Self::cancel_turn))
-            .child(self.render_sidebar(cx))
+            .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_context))
+            .when(sidebar_visible, |el| el.child(self.render_sidebar(cx)))
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .h_full()
                     .flex()
                     .flex_col()
+                    .bg(theme.background)
+                    .child(
+                        div()
+                            .h(px(HEADER_HEIGHT))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px_5()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_baseline()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .text_size(px(14.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme.text)
+                                            .child(self.selected_view.as_ref().map_or_else(
+                                                || "New session".to_string(),
+                                                |view| view.title.clone(),
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(theme.faint)
+                                            .child(self.model.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("show-context")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted)
+                                    .hover(|style| style.bg(theme.raised).cursor_pointer())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|workspace, _, window, cx| {
+                                            workspace.toggle_context(&ToggleContext, window, cx)
+                                        }),
+                                    )
+                                    .child(if context_visible { "Hide" } else { "Context" }),
+                            ),
+                    )
                     .child(self.render_transcript())
                     .children(
                         self.pending_approval
@@ -977,7 +1334,7 @@ impl Render for Workspace {
                             .flex()
                             .gap_2()
                             .border_t_1()
-                            .border_color(rgb(0x252b34))
+                            .border_color(theme.border)
                             .child(div().flex_1().child(self.input.clone()))
                             .child(
                                 div()
@@ -988,17 +1345,21 @@ impl Render for Workspace {
                                     .justify_center()
                                     .rounded_md()
                                     .bg(if self.busy {
-                                        rgb(0x39404a)
+                                        theme.raised
                                     } else {
-                                        rgb(0x246b53)
+                                        theme.accent
                                     })
                                     .text_size(px(13.))
-                                    .text_color(rgb(0xe8fff6))
+                                    .text_color(if self.busy {
+                                        theme.faint
+                                    } else {
+                                        theme.background
+                                    })
                                     .hover(|style| {
                                         if self.busy {
                                             style
                                         } else {
-                                            style.bg(rgb(0x2d8465)).cursor_pointer()
+                                            style.cursor_pointer()
                                         }
                                     })
                                     .on_mouse_down(
@@ -1013,11 +1374,14 @@ impl Render for Workspace {
                     .child(
                         div()
                             .px_6()
-                            .pb_3()
+                            .h(px(STATUS_HEIGHT))
+                            .flex()
+                            .items_center()
                             .text_size(px(11.))
-                            .text_color(rgb(0x77828f))
+                            .text_color(theme.faint)
                             .child(self.status.clone()),
                     ),
             )
+            .when(context_visible, |el| el.child(self.render_context_pane(cx)))
     }
 }
