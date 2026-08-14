@@ -4,8 +4,8 @@ A native Rust + GPUI desktop milestone for the DeepSeek Harness agent model. It 
 
 ## Current capabilities
 
-- GPU-accelerated native macOS interface built with GPUI 0.2.2.
-- Comet-inspired three-pane developer workbench: a 256 px spaces/sessions rail, center transcript and composer, and a persisted 420 px context pane.
+- GPU-accelerated native macOS interface built on the exact pinned GPUI fork used by Comet.
+- Comet-fidelity three-pane developer workbench: a 256 px spaces/sessions rail, unified 38 px titlebar, center transcript and composer, and a persisted 520 px context pane.
 - Read-only Git changes scanning for the scoped workspace with branch, tracking, staged/worktree, line totals, and clickable per-file diffs.
 - Append-only, replayable JSONL session logs.
 - Automatic bounded session titles from the first user message.
@@ -36,11 +36,14 @@ A native Rust + GPUI desktop milestone for the DeepSeek Harness agent model. It 
 ## Build
 
 ```sh
+scripts/bootstrap-gpui-fork.sh
 cargo fmt --all
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release
 ```
+
+The bootstrap script downloads and checksum-verifies the pinned `wingleeio/zed` GPUI source snapshot used by the current Comet UI. It places the local source under ignored `vendor/`; the archive and source are not committed to the repository.
 
 The release executable is `target/release/dsh-app`.
 
@@ -129,7 +132,7 @@ The sidebar search field filters titles and transcript content. Enter in the ren
 The native shell uses a dense dark three-pane layout adapted from the MIT-licensed Comet UI direction:
 
 - Left rail: spaces, session search, sessions, and model access.
-- Center pane: session header, transcript, tool approvals, composer, and reserved status strip.
+- Center pane: unified session titlebar, transcript, tool approvals, composer, and reserved status strip.
 - Right pane: selected-session model/event/turn/prompt state plus recent tool activity.
 - Git changes: branch and ahead/behind state, bounded changed-file rows, staged/worktree labels, `git diff --numstat` line totals, and clickable unified diffs.
 

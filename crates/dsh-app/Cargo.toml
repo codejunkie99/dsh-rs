@@ -5,7 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "runtime_shaders"] }
+gpui.workspace = true
+gpui_platform.workspace = true
 harness-core = { path = "../harness-core" }
 serde.workspace = true
 serde_json.workspace = true
