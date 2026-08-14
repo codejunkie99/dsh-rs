@@ -661,50 +661,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filesystem_tools_execute_model_requests() {
+    async fn filesystem_tools_execute_canonical_read_and_write_requests() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("workspace")).unwrap();
+        std::fs::write(
+            root.path().join("workspace/hello.txt"),
+            "one\ntwo\nthree\nfour\n",
+        )
+        .unwrap();
         let fs = std::sync::Arc::new(ScopedFs::new(root.path()).unwrap());
 
         let write = WriteFileTool::new(fs.clone());
-        assert_eq!(write.spec().name, "write_file");
+        assert_eq!(write.spec().name, "write");
         let output = write
             .execute(ToolInvocation {
                 call_id: "call_write".into(),
-                name: "write_file".into(),
+                name: "write".into(),
                 arguments: serde_json::json!({
-                    "path": "workspace/hello.txt",
+                    "file_path": "workspace/new.txt",
                     "content": "hello"
                 }),
             })
             .await
             .unwrap();
         assert!(output.ok);
-        assert!(output.output.contains("workspace/hello.txt"));
+        assert!(output.output.contains("<path>workspace/new.txt</path>"));
+        assert!(output.output.contains("Created file"));
 
         let read = ReadFileTool::new(fs.clone());
-        assert_eq!(read.spec().name, "read_file");
+        assert_eq!(read.spec().name, "read");
         let output = read
             .execute(ToolInvocation {
                 call_id: "call_read".into(),
-                name: "read_file".into(),
-                arguments: serde_json::json!({"path": "workspace/hello.txt"}),
+                name: "read".into(),
+                arguments: serde_json::json!({
+                    "file_path": "workspace/hello.txt",
+                    "offset": 2,
+                    "limit": 2
+                }),
             })
             .await
             .unwrap();
-        assert_eq!(output.output, "hello");
-
-        let list = ListDirTool::new(fs);
-        assert_eq!(list.spec().name, "list_dir");
-        let output = list
-            .execute(ToolInvocation {
-                call_id: "call_list".into(),
-                name: "list_dir".into(),
-                arguments: serde_json::json!({"path": "workspace"}),
-            })
-            .await
-            .unwrap();
-        assert!(output.output.contains("hello.txt"));
-        assert!(output.output.contains("file"));
+        assert_eq!(
+            output.output,
+            "<path>workspace/hello.txt</path>\n<type>file</type>\n<content>\n2: two\n3: three\n\n(Showing lines 2-3 of 4. Use offset=4 to continue.)\n</content>"
+        );
     }
+
+    #[tokio::test]
+    async fn read_rejects_invalid_windows_and_reports_eof() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let read = ReadFileTool::new(std::sync::Arc::new(ScopedFs::new(root.path()).unwrap()));
+
+        for (arguments, expected) in [
+            (serde_json::json!({"file_path": "a.txt", "offset": 0}), "offset must be a positive integer"),
+            (serde_json::json!({"file_path": "a.txt", "limit": 0}), "limit must be a positive integer"),
+            (serde_json::json!({"file_path": "a.txt", "limit": 2001}), "limit must be less than or equal to 2000"),
+            (serde_json::json!({"file_path": "a.txt", "offset": 3}), "offset 3 is out of range for \"a.txt\" (2 lines)"),
+        ] {
+            let error = read.execute(ToolInvocation {
+                call_id: "call_read".into(),
+                name: "read".into(),
+                arguments,
+            }).await.unwrap_err();
+            assert!(error.to_string().contains(expected), "{}", error);
+        }
+    }
+
 }
