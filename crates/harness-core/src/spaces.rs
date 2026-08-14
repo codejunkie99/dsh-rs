@@ -96,6 +96,38 @@ impl SpacesConfig {
         self.spaces.iter().find(|space| space.id == id)
     }
 
+    pub fn add_project(&mut self, name: impl AsRef<str>, root: impl AsRef<Path>) -> Result<Space> {
+        let name = name.as_ref().trim();
+        if name.is_empty() {
+            bail!("space name cannot be empty");
+        }
+        let lowercased_name = name.to_lowercase();
+        if self
+            .spaces
+            .iter()
+            .any(|space| space.name.trim().to_lowercase() == lowercased_name)
+        {
+            bail!("duplicate space name: {name}");
+        }
+
+        let mut id = uuid::Uuid::new_v4().to_string();
+        while self.get(&id).is_some() {
+            id = uuid::Uuid::new_v4().to_string();
+        }
+        let mut space = Space::new(id, name, root.as_ref().to_path_buf())?;
+        space.canonicalize_root()?;
+        self.spaces.push(space);
+        if let Err(error) = self.validate() {
+            self.spaces.pop();
+            return Err(error);
+        }
+        Ok(self
+            .spaces
+            .last()
+            .expect("the new space was just inserted")
+            .clone())
+    }
+
     pub fn parse(raw: &str) -> Result<Self> {
         let config: Self = serde_json::from_str(raw).context("invalid spaces config")?;
         config.validate()?;
@@ -228,5 +260,35 @@ mod tests {
         assert_eq!(config.spaces()[0].id(), "local");
         assert_eq!(config.spaces()[0].name(), "Local harness");
         assert_eq!(config.spaces()[0].root(), workspace.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn add_project_generates_a_durable_space_without_partial_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let path = dir.path().join("spaces.json");
+        let mut config = SpacesConfig::local(&workspace);
+
+        let added = config
+            .add_project("  Project  ", &project)
+            .expect("valid project space");
+        assert_ne!(added.id(), "local");
+        assert_eq!(added.name(), "Project");
+        assert_eq!(added.root(), project.canonicalize().unwrap());
+        config.save(&path).unwrap();
+
+        let persisted = SpacesConfig::load(&path).unwrap();
+        assert_eq!(persisted.spaces().len(), 2);
+        assert_eq!(persisted.get(added.id()).unwrap().name(), "Project");
+
+        let before = config.clone();
+        let error = config
+            .add_project("project", &project)
+            .expect_err("duplicate project name");
+        assert!(error.to_string().contains("duplicate space name"));
+        assert_eq!(config, before);
     }
 }
