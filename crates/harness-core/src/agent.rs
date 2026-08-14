@@ -3,7 +3,9 @@ use crate::cancellation::TurnCancellation;
 use crate::events::{EventKind, TurnCompletionReason, Usage};
 use crate::llm::{ChatMessage, LlmAdapter, LlmRequest, StreamFrame, ToolCallRequest};
 use crate::session::SessionLog;
-use crate::tools::{ToolInvocation, ToolRegistry};
+use crate::skills::is_skill_name;
+use crate::tools::skill::render_skill_catalog;
+use crate::tools::{SkillTool, ToolInvocation, ToolRegistry};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -16,6 +18,7 @@ pub struct AgentLoop {
     default_model: Option<String>,
     system_prompt: Option<String>,
     max_steps: u64,
+    skill_tool: Option<Arc<SkillTool>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +36,7 @@ impl AgentLoop {
             default_model: None,
             system_prompt: None,
             max_steps: 24,
+            skill_tool: None,
         }
     }
 
@@ -53,6 +57,11 @@ impl AgentLoop {
 
     pub fn with_approver(mut self, approver: Arc<dyn ToolApprover>) -> Self {
         self.approver = approver;
+        self
+    }
+
+    pub fn with_skill_tool(mut self, skill_tool: Arc<SkillTool>) -> Self {
+        self.skill_tool = Some(skill_tool);
         self
     }
 
@@ -81,7 +90,7 @@ impl AgentLoop {
         log.append(EventKind::TurnStarted)?;
         log.append(EventKind::UserMessage {
             id: Uuid::new_v4(),
-            content: input,
+            content: input.clone(),
         })?;
         if log.view().title == "New session" {
             if let Some(title) = Self::automatic_title(&log.events()) {
@@ -97,6 +106,7 @@ impl AgentLoop {
             })?;
             return Ok(TurnOutcome::Cancelled);
         }
+        self.prepare_skill_context(&log, &input).await?;
 
         for step in 0..self.max_steps {
             if cancellation.is_cancelled() {
@@ -284,6 +294,38 @@ impl AgentLoop {
         Ok(())
     }
 
+    async fn prepare_skill_context(
+        &self,
+        log: &Arc<SessionLog>,
+        input: &str,
+    ) -> anyhow::Result<()> {
+        let Some(skill_tool) = &self.skill_tool else {
+            return Ok(());
+        };
+        if !self.tools.specs().iter().any(|spec| spec.name == "skill") {
+            return Ok(());
+        }
+
+        let entries = skill_tool.catalog_entries().await?;
+        let already_published = log
+            .events()
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::SkillCatalogPublished { .. }));
+        if !entries.is_empty() && !already_published {
+            log.append(EventKind::SkillCatalogPublished {
+                content: render_skill_catalog(&entries),
+                entries,
+            })?;
+        }
+
+        for name in invoked_skill_names(input) {
+            if let Some(content) = skill_tool.invoke_user(&name).await? {
+                log.append(EventKind::SkillInvocationInjected { name, content })?;
+            }
+        }
+        Ok(())
+    }
+
     fn automatic_title(events: &[crate::events::SessionEvent]) -> Option<String> {
         let input = events.iter().rev().find_map(|event| {
             if let EventKind::UserMessage { content, .. } = &event.kind {
@@ -327,6 +369,12 @@ impl AgentLoop {
                 EventKind::UserMessage { content, .. } => messages.push(ChatMessage::User {
                     content: content.clone(),
                 }),
+                EventKind::SkillCatalogPublished { content, .. }
+                | EventKind::SkillInvocationInjected { content, .. } => {
+                    messages.push(ChatMessage::User {
+                        content: content.clone(),
+                    });
+                }
                 EventKind::AssistantMessage { content, .. } => {
                     messages.push(ChatMessage::Assistant {
                         content: content.clone(),
@@ -370,6 +418,35 @@ impl AgentLoop {
         }
         messages
     }
+}
+
+fn invoked_skill_names(input: &str) -> Vec<String> {
+    let bytes = input.as_bytes();
+    let mut names = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let starts_at_boundary = index == 0 || bytes[index - 1].is_ascii_whitespace();
+        if bytes[index] == b'/' && starts_at_boundary {
+            let start = index + 1;
+            let mut end = start;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_lowercase()
+                    || bytes[end].is_ascii_digit()
+                    || bytes[end] == b'-')
+            {
+                end += 1;
+            }
+            let ends_at_boundary = end == bytes.len() || bytes[end].is_ascii_whitespace();
+            if ends_at_boundary && start < end {
+                let name = &input[start..end];
+                if is_skill_name(name) && !names.iter().any(|existing| existing == name) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        index += 1;
+    }
+    names
 }
 
 #[cfg(test)]
