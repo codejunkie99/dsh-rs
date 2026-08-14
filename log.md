@@ -407,3 +407,18 @@ KEPT: Nothing verifiable; the latest run contains only a timestamp.
 WASTED: No inspection, implementation, verification, or progress evidence was recorded.
 FAILED: No code/tests/results or `PROGRESS_JSON`; full parity remains incomplete.
 NEXT: Implement canonical `write`/`read` with exact windowing semantics and named registry-dispatch regressions.
+
+## Cloud continuation cycle 2 — filesystem/search parity
+
+Implemented on branch `codex-cloud/dsh-rs-parity` after verified starting commit `b409cb87fa6286022717a4eec3a0dd5a8c8e761e`.
+
+- `ReadFileTool` now advertises canonical upstream `read` with `file_path`, 1-based `offset`, and bounded `limit`.
+- Read output now follows the upstream envelope, line numbering, continuation/end-of-file footer, CRLF normalization, 2,000-character line cap, and 50 KiB output cap.
+- `WriteFileTool` now advertises canonical upstream `write` with `file_path` and `content`, preserving atomic scoped writes and emitting Created/Updated envelopes.
+- Harness catalogs, default presets, and GPUI app assembly now use canonical `read`/`write`.
+- Added scoped `glob` and `grep` catalog tools and registry-dispatch regressions. The current grep implementation is a bounded literal matcher; ripgrep-regex and sampled-over-cap persistence remain open.
+- Added `tool_fs.rs` and `tool_search.rs` regressions; updated `docs/parity/tool-audit.md`, `PROGRESS.md`, and `progress-board.json`.
+
+Verification:
+- GitHub Actions was triggered for the resulting commits, but both Linux and macOS jobs concluded failure within the hosted run and the GitHub connector exposed no job steps/log payload. This remains an unresolved verification gate, not a claimed pass.
+- Local cloud image has no Rust toolchain (`rustfmt`, `cargo`, and `rustc` are unavailable), so local compilation cannot be substituted.
