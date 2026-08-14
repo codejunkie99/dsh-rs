@@ -135,6 +135,10 @@ impl ChatInput {
         self.content.clone()
     }
 
+    pub fn cursor_offset(&self) -> usize {
+        self.cursor_offset_impl()
+    }
+
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         let new_text = text.into();
         let mut old_content = std::mem::take(&mut self.content);
@@ -155,7 +159,7 @@ impl ChatInput {
         cx.notify();
     }
 
-    fn cursor_offset(&self) -> usize {
+    fn cursor_offset_impl(&self) -> usize {
         if self.selection_reversed {
             self.selected_range.start
         } else {
@@ -215,6 +219,15 @@ impl ChatInput {
         self.selection_reversed = false;
         self.marked_range = None;
         cx.notify();
+    }
+
+    pub fn replace_plain_token(
+        &mut self,
+        range: Range<usize>,
+        replacement: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_range(range, replacement, cx);
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {

@@ -3,7 +3,9 @@ use harness_core::events::EventKind;
 use harness_core::llm::{LlmAdapter, LlmRequest, StreamFrame};
 use harness_core::session::SessionLog;
 use harness_core::skills::{SkillInvocationPolicy, SkillRegistry};
-use harness_core::tools::skill::{render_skill_catalog, SkillCatalogEntry, SkillTool};
+use harness_core::tools::skill::{
+    render_skill_catalog, SkillCatalogEntry, SkillSlashEntry, SkillTool,
+};
 use harness_core::tools::ToolRegistry;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -78,6 +80,28 @@ async fn skill_catalog_filters_normalizes_and_renders_the_dsh_contract() {
             "</system-reminder>",
         ]
         .join("\n")
+    );
+}
+
+#[tokio::test]
+async fn slash_entries_include_user_invocable_skills_and_mark_model_visibility() {
+    let tool = SkillTool::new(skill_registry());
+    let entries = tool.slash_entries().await.unwrap();
+
+    assert_eq!(
+        entries,
+        vec![
+            SkillSlashEntry {
+                name: "a-skill".into(),
+                description: "Use   <models> & carefully.".into(),
+                model_invocable: true,
+            },
+            SkillSlashEntry {
+                name: "user-only".into(),
+                description: "Only a human may invoke this.".into(),
+                model_invocable: false,
+            },
+        ]
     );
 }
 
