@@ -39,6 +39,7 @@ pub struct SessionView {
     pub id: Uuid,
     pub title: String,
     pub model: Option<String>,
+    pub system_prompt: Option<String>,
     pub created_at: chrono::DateTime<Utc>,
     pub updated_at: chrono::DateTime<Utc>,
     pub event_count: u64,
@@ -61,6 +62,7 @@ struct SessionInner {
     events: Vec<SessionEvent>,
     title: String,
     model: Option<String>,
+    system_prompt: Option<String>,
     turn_active: bool,
     step_active: bool,
     last_error: Option<String>,
@@ -80,6 +82,7 @@ impl SessionLog {
                 events: Vec::new(),
                 title: "New session".into(),
                 model: None,
+                system_prompt: None,
                 turn_active: false,
                 step_active: false,
                 last_error: None,
@@ -190,6 +193,7 @@ impl SessionLog {
             id: self.id,
             title: inner.title.clone(),
             model: inner.model.clone(),
+            system_prompt: inner.system_prompt.clone(),
             created_at: inner
                 .events
                 .first()
@@ -273,6 +277,7 @@ impl SessionLog {
                 inner.model = model.clone();
             }
             EventKind::SessionTitleChanged { title } => inner.title = title.clone(),
+            EventKind::SystemPromptSnapshot { content } => inner.system_prompt = content.clone(),
             EventKind::TurnStarted => inner.turn_active = true,
             EventKind::TurnCompleted { reason } => {
                 inner.turn_active = false;
@@ -377,6 +382,24 @@ mod tests {
         let reopened = SessionLog::open(path).unwrap();
         assert_eq!(reopened.view().title, "Persisted");
         assert_eq!(reopened.len(), 2);
+    }
+
+    #[test]
+    fn persists_and_replays_system_prompt_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let path = dir.path().join(format!("{id}.jsonl"));
+        let log = SessionLog::with_path(id, Some(path.clone()));
+        log.append(EventKind::SystemPromptSnapshot {
+            content: Some("durable prompt".into()),
+        })
+        .unwrap();
+        log.append(EventKind::SystemPromptSnapshot { content: None })
+            .unwrap();
+        drop(log);
+
+        let reopened = SessionLog::open(path).unwrap();
+        assert_eq!(reopened.view().system_prompt, None);
     }
 
     #[test]

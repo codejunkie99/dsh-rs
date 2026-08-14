@@ -8,6 +8,7 @@ use gpui::{
 use harness_core::agent::AgentLoop;
 use harness_core::approval::{ApprovalPolicy, ApprovalRequest, ChannelApprover, GatedApprover};
 use harness_core::cancellation::TurnCancellation;
+use harness_core::prompt::SystemPromptConfig;
 use harness_core::remote::ModelSelection;
 use harness_core::session::{SessionView, TranscriptEntry};
 use harness_core::store::{SessionStore, SessionSummary};
@@ -69,6 +70,17 @@ impl Workspace {
                 ApprovalPolicy::default()
             }
         };
+        let prompt_path = home.join(".dsh-rs").join("system-prompt.json");
+        if !prompt_path.exists() {
+            let _ = SystemPromptConfig::default().save(&prompt_path);
+        }
+        let system_prompt = match SystemPromptConfig::load(&prompt_path) {
+            Ok(config) => config.render(),
+            Err(error) => {
+                eprintln!("system prompt config load failed ({error}); using default identity");
+                SystemPromptConfig::default().render()
+            }
+        };
         let (approval_channel, mut approval_requests) = ChannelApprover::channel();
         let approver = Arc::new(GatedApprover::new(approval_policy, approval_channel));
         let (store, status) = match SessionStore::open(&root) {
@@ -118,6 +130,7 @@ impl Workspace {
         }
         let agent = AgentLoop::new(selection.adapter.clone(), Arc::new(tools))
             .with_default_model(Some(selection.model.clone()))
+            .with_system_prompt(system_prompt)
             .with_approver(approver)
             .with_max_steps(8);
 

@@ -13,6 +13,7 @@ A native Rust + GPUI desktop milestone for the DeepSeek Harness agent model. It 
 - Case-insensitive session title/transcript search.
 - Transcript projection for user, assistant, tool, and system events.
 - Adapter-driven turn/step agent loop.
+- Durable system-prompt configuration with per-session prompt snapshots and deterministic model history projection.
 - DeepSeek OpenAI-compatible streaming adapter with environment and private credential-file key resolution.
 - Transient model-request retry handling for network errors, timeouts, HTTP 408/429, and 5xx responses.
 - Live transcript and session-state refresh driven by append-only event notifications.
@@ -55,6 +56,19 @@ Sessions are stored in:
 Each line is one typed session event. Delete the directory to reset local state. Corrupt files are skipped without preventing valid sessions from loading.
 
 The sidebar search field filters titles and transcript content. Enter in the rename field updates the selected session title as a durable `session_title_changed` event.
+
+## System prompt
+
+The config is stored in `~/.dsh-rs/system-prompt.json`:
+
+```json
+{
+  "include_harness_identity": true,
+  "persona": "Be precise and verify changes before claiming completion."
+}
+```
+
+The rendered prompt is snapshotted into a session when it changes, so reopening and forking preserve the prompt state that governed the session. The next model request receives the latest snapshot as its single leading system message. Unknown fields and malformed JSON are rejected by the loader instead of being silently interpreted.
 
 Fork copies all durable events through the selected boundary into a new session ID and JSONL file. Markdown exports are written to:
 
