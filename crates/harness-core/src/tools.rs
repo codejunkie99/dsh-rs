@@ -1,6 +1,7 @@
 pub mod fs;
 pub mod shell;
 pub mod skill;
+pub mod search;
 pub mod todo;
 
 pub use skill::SkillTool;
