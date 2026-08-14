@@ -23,3 +23,6 @@ dialog; Comet's full folder-browser/device palette and rendered parity check
 remain open. A fresh rendered comparison is pending until the macOS display is
 unlocked; while locked, `loginwindow` is frontmost and screen capture returns a
 black frame for both the Rust app and the known-good packaged binary.
+The durable DSH Todo projection now drives a Comet-style transcript checklist
+card and the DSH plan strip above the composer. Comet's exact tool chip,
+animated progress glyph, and rendered comparison remain open.
