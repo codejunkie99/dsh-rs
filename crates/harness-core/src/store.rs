@@ -11,6 +11,7 @@ pub struct SessionSummary {
     pub id: Uuid,
     pub title: String,
     pub model: Option<String>,
+    pub space_id: Option<String>,
     pub event_count: u64,
     pub turn_active: bool,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -89,12 +90,22 @@ impl SessionStore {
         title: impl Into<String>,
         model: Option<String>,
     ) -> Result<SharedSessionLog> {
+        self.create_in_space(title, model, None)
+    }
+
+    pub fn create_in_space(
+        &self,
+        title: impl Into<String>,
+        model: Option<String>,
+        space_id: Option<String>,
+    ) -> Result<SharedSessionLog> {
         let id = Uuid::new_v4();
         let path = self.root.join(format!("{id}.jsonl"));
         let log = SharedSessionLog::new(SessionLog::with_path(id, Some(path)));
         log.append(EventKind::SessionStarted {
             title: Some(title.into()),
             model,
+            space_id,
         })?;
         self.logs.write().push(log.clone());
         Ok(log)
@@ -105,6 +116,14 @@ impl SessionStore {
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("session {id} does not exist"))?;
         log.set_title(title)?;
+        Ok(log)
+    }
+
+    pub fn set_space(&self, id: Uuid, space_id: impl Into<String>) -> Result<SharedSessionLog> {
+        let log = self
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("session {id} does not exist"))?;
+        log.set_space(space_id)?;
         Ok(log)
     }
 
@@ -217,6 +236,7 @@ impl SessionStore {
             id: view.id,
             title: view.title.clone(),
             model: view.model.clone(),
+            space_id: view.space_id.clone(),
             event_count: view.event_count,
             turn_active: view.turn_active,
             updated_at: view.updated_at,
@@ -259,6 +279,7 @@ mod tests {
             .append(EventKind::SessionStarted {
                 title: Some("Valid".into()),
                 model: None,
+                space_id: None,
             })
             .unwrap();
         let corrupt_id = Uuid::new_v4();
@@ -306,6 +327,27 @@ mod tests {
             .list()
             .iter()
             .any(|summary| summary.title == "My fork"));
+    }
+
+    #[test]
+    fn spaces_are_listed_changed_and_preserved_by_forks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let source = store
+            .create_in_space("Source", Some("local-null".into()), Some("local".into()))
+            .unwrap();
+        assert_eq!(source.view().space_id.as_deref(), Some("local"));
+        assert_eq!(store.list()[0].space_id.as_deref(), Some("local"));
+
+        store.set_space(source.id(), "research").unwrap();
+        let fork = store.fork(source.id(), None, "Fork").unwrap();
+        assert_eq!(fork.view().space_id.as_deref(), Some("research"));
+
+        let reopened = SessionStore::open(dir.path()).unwrap();
+        assert!(reopened
+            .list()
+            .iter()
+            .all(|summary| { summary.space_id.as_deref() == Some("research") }));
     }
 
     #[test]

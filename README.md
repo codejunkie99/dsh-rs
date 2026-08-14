@@ -21,7 +21,8 @@ A native Rust + GPUI desktop milestone for the DeepSeek Harness agent model. It 
 - Transient model-request retry handling for network errors, timeouts, HTTP 408/429, and 5xx responses.
 - Live transcript and session-state refresh driven by append-only event notifications.
 - Tool registry and echo tool execution path.
-- Read/list filesystem tools confined to `~/.dsh-rs/workspace`; traversal and symlink escapes are rejected.
+- Multiple configured spaces with durable per-session space associations. Read/list filesystem tools are confined to the selected space; traversal and symlink escapes are rejected.
+- Keyboard space cycling with `Cmd+Shift+Right` and `Cmd+Shift+Left`.
 - Durable fail-closed approval policy with native GPUI Approve/Deny prompts for `ask` tools.
 - Responsive turn cancellation with a durable cancelled turn event and native Cancel control.
 - Optional direct-execution shell tool with canonical binary allowlist, cleared environment, workspace cwd, timeout, and bounded output.
@@ -57,6 +58,31 @@ Sessions are stored in:
 ```
 
 Each line is one typed session event. Delete the directory to reset local state. Corrupt files are skipped without preventing valid sessions from loading.
+
+## Spaces
+
+Spaces are defined in `~/.dsh-rs/spaces.json`. Roots must be existing absolute directories and are canonicalized before use:
+
+```json
+{
+  "spaces": [
+    {
+      "id": "local",
+      "name": "Local harness",
+      "root": "/Users/example/.dsh-rs/workspace"
+    },
+    {
+      "id": "project",
+      "name": "Project",
+      "root": "/Users/example/Projects/project"
+    }
+  ]
+}
+```
+
+The first entry is the fail-safe default. Selecting a space records a durable `session_space_changed` event on the current session; new sessions and forks preserve the active space. Filesystem tools, shell cwd, and Git scanning all use that space's root. Invalid or empty configurations fall back to the local harness without widening filesystem scope.
+
+Press `Cmd+Shift+Right` to activate the next space or `Cmd+Shift+Left` to activate the previous one. Space rows are also directly clickable.
 
 The sidebar search field filters titles and transcript content. Enter in the rename field updates the selected session title as a durable `session_title_changed` event.
 
@@ -152,7 +178,7 @@ Shell execution is disabled until `~/.dsh-rs/shell.json` allowlists at least one
 
 Commands run with:
 
-- the canonical `~/.dsh-rs/workspace` as cwd
+- the canonical selected-space root as cwd
 - an empty environment
 - no inherited stdin
 - piped and bounded stdout/stderr

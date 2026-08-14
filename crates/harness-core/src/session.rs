@@ -39,6 +39,7 @@ pub struct SessionView {
     pub id: Uuid,
     pub title: String,
     pub model: Option<String>,
+    pub space_id: Option<String>,
     pub system_prompt: Option<String>,
     pub created_at: chrono::DateTime<Utc>,
     pub updated_at: chrono::DateTime<Utc>,
@@ -62,6 +63,7 @@ struct SessionInner {
     events: Vec<SessionEvent>,
     title: String,
     model: Option<String>,
+    space_id: Option<String>,
     system_prompt: Option<String>,
     turn_active: bool,
     step_active: bool,
@@ -82,6 +84,7 @@ impl SessionLog {
                 events: Vec::new(),
                 title: "New session".into(),
                 model: None,
+                space_id: None,
                 system_prompt: None,
                 turn_active: false,
                 step_active: false,
@@ -174,6 +177,18 @@ impl SessionLog {
         self.append(EventKind::SessionModelChanged { model })
     }
 
+    pub fn set_space(&self, space_id: impl Into<String>) -> Result<SessionEvent> {
+        let space_id = space_id.into();
+        if self.view().space_id.as_deref() == Some(space_id.as_str()) {
+            return Ok(self
+                .events()
+                .last()
+                .cloned()
+                .expect("session logs always contain at least one event"));
+        }
+        self.append(EventKind::SessionSpaceChanged { space_id })
+    }
+
     pub fn append_with_metadata(
         &self,
         kind: EventKind,
@@ -205,6 +220,7 @@ impl SessionLog {
             id: self.id,
             title: inner.title.clone(),
             model: inner.model.clone(),
+            space_id: inner.space_id.clone(),
             system_prompt: inner.system_prompt.clone(),
             created_at: inner
                 .events
@@ -282,14 +298,24 @@ impl SessionLog {
 
     fn apply(inner: &mut SessionInner, event: &SessionEvent) {
         match &event.kind {
-            EventKind::SessionStarted { title, model } => {
+            EventKind::SessionStarted {
+                title,
+                model,
+                space_id,
+            } => {
                 if let Some(title) = title {
                     inner.title = title.clone();
                 }
                 inner.model = model.clone();
+                if space_id.is_some() {
+                    inner.space_id = space_id.clone();
+                }
             }
             EventKind::SessionTitleChanged { title } => inner.title = title.clone(),
             EventKind::SessionModelChanged { model } => inner.model = Some(model.clone()),
+            EventKind::SessionSpaceChanged { space_id } => {
+                inner.space_id = Some(space_id.clone());
+            }
             EventKind::SystemPromptSnapshot { content } => inner.system_prompt = content.clone(),
             EventKind::TurnStarted => inner.turn_active = true,
             EventKind::TurnCompleted { reason } => {
@@ -353,6 +379,7 @@ mod tests {
         log.append(EventKind::SessionStarted {
             title: Some("Test".into()),
             model: Some("test-model".into()),
+            space_id: None,
         })
         .unwrap();
         log.append(EventKind::UserMessage {
@@ -383,6 +410,7 @@ mod tests {
         log.append(EventKind::SessionStarted {
             title: Some("Persisted".into()),
             model: None,
+            space_id: None,
         })
         .unwrap();
         log.append(EventKind::UserMessage {
@@ -424,6 +452,7 @@ mod tests {
         log.append(EventKind::SessionStarted {
             title: Some("Model test".into()),
             model: Some("local-null".into()),
+            space_id: None,
         })
         .unwrap();
         log.set_model("deepseek-chat").unwrap();
@@ -431,6 +460,42 @@ mod tests {
 
         let reopened = SessionLog::open(path).unwrap();
         assert_eq!(reopened.view().model.as_deref(), Some("deepseek-chat"));
+    }
+
+    #[test]
+    fn space_changes_are_durable_and_old_sessions_replay_without_a_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let path = dir.path().join(format!("{id}.jsonl"));
+        let log = SessionLog::with_path(id, Some(path.clone()));
+        log.append(EventKind::SessionStarted {
+            title: Some("Space test".into()),
+            model: Some("local-null".into()),
+            space_id: Some("local".into()),
+        })
+        .unwrap();
+        log.append(EventKind::SessionSpaceChanged {
+            space_id: "research".into(),
+        })
+        .unwrap();
+        drop(log);
+
+        let reopened = SessionLog::open(path).unwrap();
+        assert_eq!(reopened.view().space_id.as_deref(), Some("research"));
+
+        let legacy_id = Uuid::new_v4();
+        let legacy_path = dir.path().join(format!("{legacy_id}.jsonl"));
+        std::fs::write(
+            &legacy_path,
+            format!(
+                r#"{{"seq":1,"id":"{}","session_id":"{}","timestamp":"2026-08-14T00:00:00Z","type":"session_started","data":{{"title":"Legacy","model":null}}}}"#,
+                Uuid::new_v4(),
+                legacy_id
+            ),
+        )
+        .unwrap();
+        let legacy = SessionLog::open(legacy_path).unwrap();
+        assert_eq!(legacy.view().space_id, None);
     }
 
     #[test]

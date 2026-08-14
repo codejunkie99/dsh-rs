@@ -12,8 +12,8 @@ use input::{
     Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft, SelectRight,
 };
 use workspace::{
-    CancelTurn, NewSession, RenameSession, SaveCredential, SearchSessions, Submit, ToggleContext,
-    ToggleSidebar, Workspace,
+    CancelTurn, NewSession, NextSpace, PreviousSpace, RenameSession, SaveCredential,
+    SearchSessions, Submit, ToggleContext, ToggleSidebar, Workspace,
 };
 
 const APP_TITLE: &str = "DeepSeek Harness RS";
@@ -30,6 +30,8 @@ fn main() {
             KeyBinding::new("cmd-.", CancelTurn, Some("Workspace")),
             KeyBinding::new("cmd-s", ToggleSidebar, Some("Workspace")),
             KeyBinding::new("cmd-b", ToggleContext, Some("Workspace")),
+            KeyBinding::new("cmd-shift-right", NextSpace, None),
+            KeyBinding::new("cmd-shift-left", PreviousSpace, None),
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("delete", Delete, None),
             KeyBinding::new("left", Left, None),

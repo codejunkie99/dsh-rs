@@ -6,5 +6,6 @@ pub mod llm;
 pub mod prompt;
 pub mod remote;
 pub mod session;
+pub mod spaces;
 pub mod store;
 pub mod tools;
