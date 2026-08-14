@@ -7,9 +7,9 @@ use crate::prompt::SystemPromptConfig;
 
 pub const SUPPORTED_TOOLS: [&str; 8] = [
     "echo",
-    "read_file",
+    "read",
     "list_dir",
-    "write_file",
+    "write",
     "edit",
     "run_command",
     "todo_write",
@@ -112,9 +112,9 @@ impl Default for HarnessSetupsConfig {
                     },
                     vec![
                         "echo".into(),
-                        "read_file".into(),
+                        "read".into(),
                         "list_dir".into(),
-                        "write_file".into(),
+                        "write".into(),
                         "edit".into(),
                         "run_command".into(),
                         "todo_write".into(),
@@ -130,7 +130,7 @@ impl Default for HarnessSetupsConfig {
                         include_harness_identity: true,
                         persona: "Read the selected workspace and answer from evidence. Do not mutate files.".into(),
                     },
-                    vec!["echo".into(), "read_file".into(), "list_dir".into()],
+                    vec!["echo".into(), "read".into(), "list_dir".into()],
                     4,
                 )
                 .expect("research setup is valid"),
@@ -243,7 +243,7 @@ mod tests {
                 "include_harness_identity": true,
                 "persona": "Work carefully in the selected repository."
               },
-              "enabled_tools": ["echo", "read_file", "list_dir", "write_file"],
+              "enabled_tools": ["echo", "read", "list_dir", "write"],
               "max_steps": 8
             },
             {
@@ -253,7 +253,7 @@ mod tests {
                 "include_harness_identity": true,
                 "persona": "Answer from files without mutation."
               },
-              "enabled_tools": ["echo", "read_file", "list_dir"],
+              "enabled_tools": ["echo", "read", "list_dir"],
               "max_steps": 4
             }
           ]
@@ -265,7 +265,7 @@ mod tests {
         assert_eq!(code.name(), "Code");
         assert_eq!(
             code.enabled_tools(),
-            ["echo", "read_file", "list_dir", "write_file"]
+            ["echo", "read", "list_dir", "write"]
         );
         assert_eq!(code.max_steps(), 8);
         assert!(code.system_prompt().render().is_some());
