@@ -1,10 +1,15 @@
 pub mod fs;
 pub mod shell;
+pub mod todo;
+
+pub use todo::TodoTool;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use crate::session::SharedSessionLog;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -30,6 +35,14 @@ pub struct ToolOutput {
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     async fn execute(&self, invocation: ToolInvocation) -> anyhow::Result<ToolOutput>;
+
+    async fn execute_with_session(
+        &self,
+        invocation: ToolInvocation,
+        _session: Option<SharedSessionLog>,
+    ) -> anyhow::Result<ToolOutput> {
+        self.execute(invocation).await
+    }
 }
 
 #[derive(Default, Clone)]
@@ -62,8 +75,16 @@ impl ToolRegistry {
     }
 
     pub async fn execute(&self, invocation: ToolInvocation) -> ToolOutput {
+        self.execute_with_session(invocation, None).await
+    }
+
+    pub async fn execute_with_session(
+        &self,
+        invocation: ToolInvocation,
+        session: Option<SharedSessionLog>,
+    ) -> ToolOutput {
         match self.tools.get(&invocation.name) {
-            Some(tool) => match tool.execute(invocation).await {
+            Some(tool) => match tool.execute_with_session(invocation, session).await {
                 Ok(output) => output,
                 Err(err) => ToolOutput {
                     ok: false,

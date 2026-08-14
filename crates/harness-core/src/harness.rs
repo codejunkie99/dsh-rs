@@ -5,8 +5,14 @@ use std::path::Path;
 
 use crate::prompt::SystemPromptConfig;
 
-pub const SUPPORTED_TOOLS: [&str; 5] =
-    ["echo", "read_file", "list_dir", "write_file", "run_command"];
+pub const SUPPORTED_TOOLS: [&str; 6] = [
+    "echo",
+    "read_file",
+    "list_dir",
+    "write_file",
+    "run_command",
+    "todo_write",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +114,7 @@ impl Default for HarnessSetupsConfig {
                         "list_dir".into(),
                         "write_file".into(),
                         "run_command".into(),
+                        "todo_write".into(),
                     ],
                     8,
                 )
@@ -310,6 +317,15 @@ mod tests {
         assert!(config.get("standard").is_some());
         assert!(config.get("research").is_some());
         assert!(config.get("minimal").is_some());
+    }
+
+    #[test]
+    fn todo_write_is_a_first_class_standard_tool() {
+        assert!(SUPPORTED_TOOLS.contains(&"todo_write"));
+        assert!(HarnessSetupsConfig::default()
+            .get("standard")
+            .unwrap()
+            .enables("todo_write"));
     }
 
     #[test]

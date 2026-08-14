@@ -33,7 +33,7 @@ use harness_core::spaces::SpacesConfig;
 use harness_core::store::{SessionStore, SessionSummary};
 use harness_core::tools::fs::{ListDirTool, ReadFileTool, ScopedFs, WriteFileTool};
 use harness_core::tools::shell::{CommandTool, ShellPolicy};
-use harness_core::tools::{EchoTool, ToolRegistry};
+use harness_core::tools::{EchoTool, TodoTool, ToolRegistry};
 use zeroize::Zeroize;
 
 const TITLEBAR_CLUSTER_BUTTONS_WIDTH: f32 = 24.0 * 3.0 + 2.0 * 2.0;
@@ -584,6 +584,9 @@ impl Workspace {
         let mut tools = ToolRegistry::new();
         if harness.enables("echo") {
             tools.register(Arc::new(EchoTool));
+        }
+        if harness.enables("todo_write") {
+            tools.register(Arc::new(TodoTool::new(true)));
         }
 
         let needs_filesystem = ["read_file", "list_dir", "write_file", "run_command"]
@@ -3661,6 +3664,17 @@ mod tests {
 
         assert!(output.ok);
         assert_eq!(output.output, "selected root");
+    }
+
+    #[test]
+    fn build_tools_registers_the_standard_todo_tool() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let setups = HarnessSetupsConfig::default();
+        let tools =
+            Workspace::build_tools(home.path(), root.path(), setups.get("standard").unwrap());
+
+        assert!(tools.specs().iter().any(|spec| spec.name == "todo_write"));
     }
 
     #[test]

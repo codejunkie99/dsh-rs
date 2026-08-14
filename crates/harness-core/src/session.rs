@@ -1,4 +1,6 @@
-use crate::events::{EventKind, SessionEvent, TurnCompletionReason};
+use crate::events::{
+    validate_todo_snapshot, EventKind, SessionEvent, TodoItem, TurnCompletionReason,
+};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use parking_lot::RwLock;
@@ -49,6 +51,7 @@ pub struct SessionView {
     pub turn_active: bool,
     pub step_active: bool,
     pub last_error: Option<String>,
+    pub todos: Option<Vec<TodoItem>>,
 }
 
 #[derive(Debug)]
@@ -70,6 +73,7 @@ struct SessionInner {
     turn_active: bool,
     step_active: bool,
     last_error: Option<String>,
+    todos: Option<Vec<TodoItem>>,
 }
 
 impl SessionLog {
@@ -92,6 +96,7 @@ impl SessionLog {
                 turn_active: false,
                 step_active: false,
                 last_error: None,
+                todos: None,
             }),
         }
     }
@@ -209,6 +214,9 @@ impl SessionLog {
         kind: EventKind,
         metadata: std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<SessionEvent> {
+        if let EventKind::TodoWrite { todos } = &kind {
+            validate_todo_snapshot(todos)?;
+        }
         let event = {
             let mut inner = self.inner.write();
             let seq = inner.events.last().map(|e| e.seq + 1).unwrap_or(1);
@@ -253,6 +261,7 @@ impl SessionLog {
             turn_active: inner.turn_active,
             step_active: inner.step_active,
             last_error: inner.last_error.clone(),
+            todos: inner.todos.clone(),
         }
     }
 
@@ -340,7 +349,11 @@ impl SessionLog {
                 inner.harness_id = Some(harness_id.clone());
             }
             EventKind::SystemPromptSnapshot { content } => inner.system_prompt = content.clone(),
-            EventKind::TurnStarted => inner.turn_active = true,
+            EventKind::TurnStarted => {
+                inner.turn_active = true;
+                inner.todos = None;
+            }
+            EventKind::TodoWrite { todos } => inner.todos = Some(todos.clone()),
             EventKind::TurnCompleted { reason } => {
                 inner.turn_active = false;
                 inner.step_active = false;
@@ -367,6 +380,9 @@ impl SessionLog {
         for line in raw.lines().filter(|line| !line.trim().is_empty()) {
             let event: SessionEvent =
                 serde_json::from_str(line).context("failed to decode session event")?;
+            if let EventKind::TodoWrite { todos } = &event.kind {
+                validate_todo_snapshot(todos)?;
+            }
             Self::apply(&mut inner, &event);
             inner.events.push(event);
         }
