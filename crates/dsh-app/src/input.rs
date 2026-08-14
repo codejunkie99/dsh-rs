@@ -38,6 +38,8 @@ mod kind_tests {
         assert_eq!(InputKind::Chat.placeholder(), "Message DeepSeek Harness");
         assert_eq!(InputKind::Search.key_context(), "SearchInput");
         assert_eq!(InputKind::Search.placeholder(), "Search sessions");
+        assert_eq!(InputKind::SpaceSearch.key_context(), "SpacesSearch");
+        assert_eq!(InputKind::SpaceSearch.placeholder(), "Search projects...");
         assert_eq!(InputKind::Rename.key_context(), "RenameInput");
         assert_eq!(InputKind::Rename.placeholder(), "Session title");
         assert_eq!(InputKind::ApiKey.key_context(), "ApiKeyInput");
@@ -51,6 +53,7 @@ mod kind_tests {
 pub enum InputKind {
     Chat,
     Search,
+    SpaceSearch,
     Rename,
     ApiKey,
     Terminal,
@@ -61,6 +64,7 @@ impl InputKind {
         match self {
             Self::Chat => "ChatInput",
             Self::Search => "SearchInput",
+            Self::SpaceSearch => "SpacesSearch",
             Self::Rename => "RenameInput",
             Self::ApiKey => "ApiKeyInput",
             Self::Terminal => "TerminalInput",
@@ -71,6 +75,7 @@ impl InputKind {
         match self {
             Self::Chat => "Message DeepSeek Harness",
             Self::Search => "Search sessions",
+            Self::SpaceSearch => "Search projects...",
             Self::Rename => "Session title",
             Self::ApiKey => "DeepSeek API key",
             Self::Terminal => "Allowlisted direct command",
