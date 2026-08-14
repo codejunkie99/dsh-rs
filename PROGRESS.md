@@ -2,7 +2,7 @@
 
 > Remaining percentages are conservative engineering estimates, not completion proofs. This file is refreshed by `scripts/update-progress-board.py` after each loop cycle.
 
-**Last update:** `2026-08-14T19:59:15Z`
+**Last update:** `2026-08-15T00:00:00Z`
 **Loop:** cycle `1`, status `max-cycles`
 **Latest slice:** Shipped one bounded, evidence-backed slice on DSH tool parity this cycle.
 
@@ -11,7 +11,7 @@
 | Workstream | Remaining | Baseline | Confidence | Status |
 |---|---:|---:|---|---|
 | Skill subsystem | **2–4%** | 50% | medium | in progress |
-| DSH tool/catalog parity | **60–67%** | 70–75% | low | in progress |
+| DSH tool/catalog parity | **52–60%** | 70–75% | low | in progress |
 | Agent/session parity | **38–46%** | 50–55% | medium | in progress |
 | Comet/UI exact parity | **60–70%** | 60–70% | low | in progress |
 | Provider/auth/logo surface | **50%** | 50% | low | in progress |
@@ -50,9 +50,12 @@ Shipped:
 - Skill tool catalog, invocation, visibility, and scoped execution contract
 - Filesystem and shell policy foundations already present
 - edit literal-replacement tool (EditFileTool): unique-match/replace_all, CRLF restore, upstream result strings
+- canonical `read`/`write` schemas and registry/app dispatch
+- bounded line-numbered `read` windows with offset/limit validation
+- scoped `glob` and `grep` catalog tools with registry regressions
 Next:
-- Align write/read names and contracts (write, read with offset/limit windowing)
-- Port glob/grep search tools and bash shell semantics
+- Complete write/read sandbox escalation and structured result metadata
+- Port remaining search caps/regex semantics and bash shell semantics
 - Match approval and execution lifecycle semantics
 - Cover browser, editor, external integration, and search behavior
 Evidence: `crates/harness-core/src/tools/`, `crates/harness-core/tests/skill_prestep.rs`, `crates/harness-core/tests/tool_edit.rs`, `docs/parity/tool-audit.md`
@@ -99,6 +102,7 @@ Next:
 
 | Cycle | Status | Summary | Recorded |
 |---:|---|---|---|
+| 2 | in progress | Shipped canonical read/write contracts, read windows, and scoped glob/grep dispatch; CI remains a verification gate. | 2026-08-15T00:00:00Z |
 | 1 | max-cycles | Shipped one bounded, evidence-backed slice on DSH tool parity this cycle. | 2026-08-14T19:59:15Z |
 | 7 | in progress | Status: Implemented the upstream `edit` tool (EditFileTool) through the real ToolRegistry dispatch path: literal unique-match/replace_all edit, CRLF normalize + line-ending restore, and upstream not-found/ambiguous/validation/result strings. Registered it in SUPPORTED_TOOLS (7→8) | 2026-08-14T19:55:19Z |
 | 6 | max-cycles | Closed the skill audit gate with explicit evidence this cycle. | 2026-08-14T19:46:05Z |
