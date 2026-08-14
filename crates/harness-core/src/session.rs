@@ -147,6 +147,18 @@ impl SessionLog {
         self.append_with_metadata(kind, Default::default())
     }
 
+    pub fn set_title(&self, title: impl Into<String>) -> Result<SessionEvent> {
+        let title = title.into();
+        if self.view().title == title {
+            return Ok(self
+                .events()
+                .last()
+                .cloned()
+                .expect("session logs always contain at least one event"));
+        }
+        self.append(EventKind::SessionTitleChanged { title })
+    }
+
     pub fn append_with_metadata(
         &self,
         kind: EventKind,

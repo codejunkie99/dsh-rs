@@ -6,7 +6,10 @@ A native Rust + GPUI desktop milestone for the DeepSeek Harness agent model. It 
 
 - GPU-accelerated native macOS interface built with GPUI 0.2.2.
 - Append-only, replayable JSONL session logs.
+- Automatic bounded session titles from the first user message.
 - Session sidebar with model, event count, and active-turn state.
+- Session forking at the current boundary and Markdown export.
+- Case-insensitive session title/transcript search API.
 - Transcript projection for user, assistant, tool, and system events.
 - Adapter-driven turn/step agent loop.
 - DeepSeek OpenAI-compatible streaming adapter with environment and private credential-file key resolution.
@@ -49,6 +52,12 @@ Sessions are stored in:
 ```
 
 Each line is one typed session event. Delete the directory to reset local state. Corrupt files are skipped without preventing valid sessions from loading.
+
+Fork copies all durable events through the selected boundary into a new session ID and JSONL file. Markdown exports are written to:
+
+```text
+~/.dsh-rs/exports/<session-id>.md
+```
 
 ## Model credentials
 
