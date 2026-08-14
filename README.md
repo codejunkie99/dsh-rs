@@ -10,6 +10,8 @@ A native Rust + GPUI desktop milestone for the DeepSeek Harness agent model. It 
 - Transcript projection for user, assistant, tool, and system events.
 - Adapter-driven turn/step agent loop.
 - DeepSeek OpenAI-compatible streaming adapter with environment and private credential-file key resolution.
+- Transient model-request retry handling for network errors, timeouts, HTTP 408/429, and 5xx responses.
+- Live transcript and session-state refresh driven by append-only event notifications.
 - Tool registry and echo tool execution path.
 - Read/list filesystem tools confined to `~/.dsh-rs/workspace`; traversal and symlink escapes are rejected.
 - Durable fail-closed approval policy with native GPUI Approve/Deny prompts for `ask` tools.
@@ -127,6 +129,6 @@ This build uses GPUI's `runtime_shaders` feature so it can build and run with th
 
 ## Current limits
 
-- Remote streaming is implemented, but request retries/rate-limit policy and credential management UI are not implemented yet.
+- Remote streaming retries are implemented, but credential management UI and circuit-break telemetry are not implemented yet.
 - The editor is a focused native single-line chat input, not a full multiline code editor.
 - Read/list/write filesystem tools are scoped and enabled. Shell execution is direct-execution and explicitly allowlisted, not a general `/bin/sh` sandbox. OS-level sandbox profiles remain future work.
