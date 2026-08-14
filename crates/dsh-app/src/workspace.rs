@@ -3,14 +3,17 @@ use std::sync::Arc;
 use crate::changes::{
     ChangeStatus, DiffLineKind, FileDiff, WorkspaceChanges, WorkspaceChangesState,
 };
+use crate::icons::{self, icon};
 use crate::input::{ChatInput, InputKind};
 use crate::settings::UiSettings;
 use crate::terminal::{parse_argv, run_command, TerminalEntry, TerminalHistory};
 use crate::theme::{
-    Theme, CONTEXT_PANE_WIDTH, HEADER_HEIGHT, SIDEBAR_WIDTH, STATUS_HEIGHT, TERMINAL_DOCK_HEIGHT,
+    titlebar_spacer_width, Theme, CONTEXT_PANE_WIDTH, CONTROL_RADIUS, HEADER_HEIGHT, SIDEBAR_WIDTH,
+    SPACE_LG, STATUS_HEIGHT, TERMINAL_DOCK_HEIGHT, TITLEBAR_HEIGHT, TITLEBAR_TOP_PAD,
 };
 use gpui::{
     actions, div, prelude::*, px, Context, Entity, FontWeight, MouseButton, SharedString, Window,
+    WindowControlArea,
 };
 use harness_core::agent::AgentLoop;
 use harness_core::approval::{
@@ -1182,6 +1185,7 @@ impl Workspace {
             .h_full()
             .flex()
             .flex_col()
+            .pt(px(TITLEBAR_HEIGHT))
             .bg(theme.surface)
             .border_r_1()
             .border_color(theme.border)
@@ -2110,6 +2114,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
+            .pt(px(TITLEBAR_HEIGHT))
             .bg(theme.background)
             .border_l_1()
             .border_color(theme.border)
@@ -2427,6 +2432,145 @@ impl Workspace {
     }
 }
 
+impl Workspace {
+    fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::dark();
+        let title = self
+            .selected_view
+            .as_ref()
+            .map(|view| view.title.clone())
+            .unwrap_or_default();
+        let target = SharedString::from(self.selected_harness().name().to_string());
+        let cluster_end = 88.0 + 76.0 + SPACE_LG;
+        let title_left = if self.ui_settings.sidebar_visible {
+            SIDEBAR_WIDTH + SPACE_LG
+        } else {
+            cluster_end
+        };
+        let title_gutter = (title_left - cluster_end).max(0.0);
+
+        div()
+            .id("comet-titlebar")
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(TITLEBAR_HEIGHT))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(2.0))
+            .px(px(10.0))
+            .pt(px(TITLEBAR_TOP_PAD))
+            .window_control_area(WindowControlArea::Drag)
+            .child(div().w(px(titlebar_spacer_width(
+                cfg!(target_os = "macos"),
+                false,
+                10.0,
+            ))))
+            .child(
+                div()
+                    .id("titlebar-toggle-sidebar")
+                    .size(px(24.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(CONTROL_RADIUS))
+                    .occlude()
+                    .hover(|style| style.bg(theme.element_hover).cursor_pointer())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|workspace, _, window, cx| {
+                            workspace.toggle_sidebar(&ToggleSidebar, window, cx)
+                        }),
+                    )
+                    .child(
+                        icon(icons::SIDEBAR_MINIMALISTIC_LEFT)
+                            .size(px(16.0))
+                            .text_color(theme.muted),
+                    ),
+            )
+            .child(
+                div()
+                    .size(px(24.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .opacity(0.35)
+                    .child(
+                        icon(icons::ARROW_LEFT)
+                            .size(px(16.0))
+                            .text_color(theme.muted),
+                    ),
+            )
+            .child(
+                div()
+                    .size(px(24.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .opacity(0.35)
+                    .child(
+                        icon(icons::ARROW_RIGHT)
+                            .size(px(16.0))
+                            .text_color(theme.muted),
+                    ),
+            )
+            .child(div().w(px(SPACE_LG)).flex_none())
+            .child(div().w(px(title_gutter)).flex_none())
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(12.0))
+                            .text_color(theme.muted)
+                            .child(target),
+                    ),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("titlebar-toggle-context")
+                    .size(px(24.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(CONTROL_RADIUS))
+                    .occlude()
+                    .hover(|style| style.bg(theme.element_hover).cursor_pointer())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|workspace, _, window, cx| {
+                            workspace.toggle_context(&ToggleContext, window, cx)
+                        }),
+                    )
+                    .child(
+                        icon(icons::SIDEBAR_MINIMALISTIC)
+                            .size(px(16.0))
+                            .text_color(theme.muted),
+                    ),
+            )
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::dark();
@@ -2437,6 +2581,8 @@ impl Render for Workspace {
             .key_context("Workspace")
             .id("workspace-root")
             .size_full()
+            .relative()
+            .font_family(theme.font_sans.clone())
             .flex()
             .bg(theme.background)
             .text_color(theme.text)
@@ -2463,57 +2609,8 @@ impl Render for Workspace {
                     .h_full()
                     .flex()
                     .flex_col()
+                    .pt(px(TITLEBAR_HEIGHT))
                     .bg(theme.background)
-                    .child(
-                        div()
-                            .h(px(HEADER_HEIGHT))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .px_5()
-                            .border_b_1()
-                            .border_color(theme.border)
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_baseline()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .text_size(px(14.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme.text)
-                                            .child(self.selected_view.as_ref().map_or_else(
-                                                || "New session".to_string(),
-                                                |view| view.title.clone(),
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .text_color(theme.faint)
-                                            .child(self.model.clone()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("show-context")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .text_size(px(11.))
-                                    .text_color(theme.muted)
-                                    .hover(|style| style.bg(theme.raised).cursor_pointer())
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|workspace, _, window, cx| {
-                                            workspace.toggle_context(&ToggleContext, window, cx)
-                                        }),
-                                    )
-                                    .child(if context_visible { "Hide" } else { "Context" }),
-                            ),
-                    )
                     .child(self.render_transcript())
                     .when(terminal_visible, |el| {
                         el.child(self.render_terminal_dock(cx))
@@ -2580,6 +2677,7 @@ impl Render for Workspace {
                     ),
             )
             .when(context_visible, |el| el.child(self.render_context_pane(cx)))
+            .child(self.render_titlebar(cx))
     }
 }
 
