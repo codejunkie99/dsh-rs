@@ -40,6 +40,13 @@ mod kind_tests {
         assert_eq!(InputKind::Search.placeholder(), "Search sessions");
         assert_eq!(InputKind::SpaceSearch.key_context(), "SpacesSearch");
         assert_eq!(InputKind::SpaceSearch.placeholder(), "Search projects...");
+        assert_eq!(InputKind::ProjectName.key_context(), "ProjectNameInput");
+        assert_eq!(InputKind::ProjectName.placeholder(), "Project name");
+        assert_eq!(InputKind::ProjectPath.key_context(), "ProjectPathInput");
+        assert_eq!(
+            InputKind::ProjectPath.placeholder(),
+            "Absolute project path"
+        );
         assert_eq!(InputKind::Rename.key_context(), "RenameInput");
         assert_eq!(InputKind::Rename.placeholder(), "Session title");
         assert_eq!(InputKind::ApiKey.key_context(), "ApiKeyInput");
@@ -54,6 +61,8 @@ pub enum InputKind {
     Chat,
     Search,
     SpaceSearch,
+    ProjectName,
+    ProjectPath,
     Rename,
     ApiKey,
     Terminal,
@@ -65,6 +74,8 @@ impl InputKind {
             Self::Chat => "ChatInput",
             Self::Search => "SearchInput",
             Self::SpaceSearch => "SpacesSearch",
+            Self::ProjectName => "ProjectNameInput",
+            Self::ProjectPath => "ProjectPathInput",
             Self::Rename => "RenameInput",
             Self::ApiKey => "ApiKeyInput",
             Self::Terminal => "TerminalInput",
@@ -76,6 +87,8 @@ impl InputKind {
             Self::Chat => "Message DeepSeek Harness",
             Self::Search => "Search sessions",
             Self::SpaceSearch => "Search projects...",
+            Self::ProjectName => "Project name",
+            Self::ProjectPath => "Absolute project path",
             Self::Rename => "Session title",
             Self::ApiKey => "DeepSeek API key",
             Self::Terminal => "Allowlisted direct command",

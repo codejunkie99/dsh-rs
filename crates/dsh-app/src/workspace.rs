@@ -146,6 +146,8 @@ pub struct Workspace {
     pub(crate) input: Entity<ChatInput>,
     search_input: Entity<ChatInput>,
     spaces_input: Entity<ChatInput>,
+    project_name_input: Entity<ChatInput>,
+    project_path_input: Entity<ChatInput>,
     rename_input: Entity<ChatInput>,
     credential_input: Entity<ChatInput>,
     terminal_input: Entity<ChatInput>,
@@ -184,6 +186,8 @@ pub struct Workspace {
     sidebar_space_filter: Option<String>,
     spaces_menu_open: bool,
     spaces_menu_active: Option<usize>,
+    add_space_open: bool,
+    add_space_error: Option<String>,
     appearance_page: Option<Entity<AppearancePage>>,
     providers_page: Option<Entity<ProvidersPage>>,
     #[allow(dead_code)]
@@ -223,6 +227,23 @@ impl Workspace {
         }
         let next = (active + delta as isize).rem_euclid(count as isize);
         Some(next as usize)
+    }
+
+    fn register_project_space(
+        config: &mut SpacesConfig,
+        config_path: &std::path::Path,
+        name: &str,
+        root: &str,
+    ) -> Result<String, String> {
+        let original = config.clone();
+        let space = config
+            .add_project(name, root)
+            .map_err(|error| format!("Could not register project: {error}"))?;
+        if let Err(error) = config.save(config_path) {
+            *config = original;
+            return Err(format!("Could not publish project: {error}"));
+        }
+        Ok(space.id().to_string())
     }
 
     fn sidebar_session_rows(
@@ -279,6 +300,8 @@ impl Workspace {
         let input = cx.new(|cx| ChatInput::new(InputKind::Chat, cx));
         let search_input = cx.new(|cx| ChatInput::new(InputKind::Search, cx));
         let spaces_input = cx.new(|cx| ChatInput::new(InputKind::SpaceSearch, cx));
+        let project_name_input = cx.new(|cx| ChatInput::new(InputKind::ProjectName, cx));
+        let project_path_input = cx.new(|cx| ChatInput::new(InputKind::ProjectPath, cx));
         let rename_input = cx.new(|cx| ChatInput::new(InputKind::Rename, cx));
         let credential_input = cx.new(|cx| ChatInput::new(InputKind::ApiKey, cx));
         let terminal_input = cx.new(|cx| ChatInput::new(InputKind::Terminal, cx));
@@ -441,6 +464,8 @@ impl Workspace {
             input,
             search_input,
             spaces_input,
+            project_name_input,
+            project_path_input,
             rename_input,
             credential_input,
             terminal_input,
@@ -479,6 +504,8 @@ impl Workspace {
             sidebar_space_filter: Some(selected_space_id.clone()),
             spaces_menu_open: false,
             spaces_menu_active: None,
+            add_space_open: false,
+            add_space_error: None,
             appearance_page: None,
             providers_page: Some(providers_page),
             providers_subscription: Some(providers_subscription),
@@ -1044,7 +1071,12 @@ impl Workspace {
         }
     }
 
-    fn activate_spaces_menu_row(&mut self, row: SpacesMenuRow, cx: &mut Context<Self>) {
+    fn activate_spaces_menu_row(
+        &mut self,
+        row: SpacesMenuRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match row {
             SpacesMenuRow::All => {
                 self.sidebar_space_filter = None;
@@ -1056,14 +1088,68 @@ impl Workspace {
                 self.close_spaces_menu(cx);
             }
             SpacesMenuRow::AddSpace => {
-                self.status =
-                    SharedString::from("Project creation is not available in this build yet.");
                 self.close_spaces_menu(cx);
+                self.open_add_space(window, cx);
             }
         }
     }
 
-    fn spaces_menu_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+    fn open_add_space(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_space_open = true;
+        self.add_space_error = None;
+        self.project_name_input
+            .update(cx, |input, cx| input.clear(cx));
+        let home = self.home.to_string_lossy().to_string();
+        self.project_path_input
+            .update(cx, |input, cx| input.set_text(home, cx));
+        let focus_handle = self.project_name_input.read(cx).focus_handle(cx).clone();
+        window.focus(&focus_handle, cx);
+        cx.notify();
+    }
+
+    fn close_add_space(&mut self, cx: &mut Context<Self>) {
+        if self.add_space_open {
+            self.add_space_open = false;
+            self.add_space_error = None;
+            cx.notify();
+        }
+    }
+
+    fn submit_add_space(&mut self, cx: &mut Context<Self>) {
+        let name = self.project_name_input.read(cx).text();
+        let root = self.project_path_input.read(cx).text();
+        let config_path = self.home.join(".dsh-rs").join("spaces.json");
+        match Self::register_project_space(
+            &mut self.spaces_config,
+            &config_path,
+            name.trim(),
+            root.trim(),
+        ) {
+            Ok(space_id) => {
+                self.close_add_space(cx);
+                if self.busy {
+                    self.status = SharedString::from(
+                        "Project registered. Wait for the current turn to activate it.",
+                    );
+                } else {
+                    self.sidebar_space_filter = Some(space_id.clone());
+                    self.select_space(&space_id, cx);
+                }
+            }
+            Err(error) => {
+                self.add_space_error = Some(error.clone());
+                self.status = SharedString::from(error);
+                cx.notify();
+            }
+        }
+    }
+
+    fn spaces_menu_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.spaces_menu_open {
             return;
         }
@@ -1087,7 +1173,7 @@ impl Workspace {
                     .get(active)
                     .cloned();
                 if let Some(row) = row {
-                    self.activate_spaces_menu_row(row, cx);
+                    self.activate_spaces_menu_row(row, window, cx);
                 }
             }
             _ => {}
@@ -1468,6 +1554,143 @@ impl Workspace {
         cx.notify();
     }
 
+    fn render_add_space(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let error = self.add_space_error.clone();
+
+        let card = div()
+            .id("add-space-card")
+            .w(px(520.0))
+            .p(px(18.0))
+            .rounded(px(14.0))
+            .border_1()
+            .border_color(theme.border.opacity(0.12))
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .bg(theme.glass_overlay())
+            .shadow_lg()
+            .text_color(theme.text)
+            .on_mouse_down_out(cx.listener(|workspace, _, _, cx| {
+                workspace.close_add_space(cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        icon(icons::FOLDER)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(15.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("New project"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.text_muted.opacity(0.7))
+                            .child("Project name"),
+                    )
+                    .child(self.project_name_input.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.text_muted.opacity(0.7))
+                            .child("Project folder"),
+                    )
+                    .child(self.project_path_input.clone()),
+            )
+            .when_some(error, |element, message| {
+                element.child(
+                    div()
+                        .id("add-space-error")
+                        .text_size(px(11.0))
+                        .text_color(theme.danger_muted)
+                        .child(SharedString::from(message)),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .id("add-space-cancel")
+                            .flex()
+                            .items_center()
+                            .rounded(px(8.0))
+                            .px(px(12.0))
+                            .py(px(7.0))
+                            .text_size(px(12.5))
+                            .text_color(theme.text_muted)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.glass_hover()).text_color(theme.text))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, _, cx| {
+                                    workspace.close_add_space(cx);
+                                }),
+                            )
+                            .child("Cancel"),
+                    )
+                    .child(
+                        div()
+                            .id("add-space-submit")
+                            .flex()
+                            .items_center()
+                            .rounded(px(8.0))
+                            .px(px(14.0))
+                            .py(px(7.0))
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .bg(theme.accent)
+                            .text_color(theme.on_accent)
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, _, cx| {
+                                    workspace.submit_add_space(cx);
+                                }),
+                            )
+                            .child("Add project"),
+                    ),
+            );
+
+        div()
+            .id("add-space-overlay")
+            .absolute()
+            .size_full()
+            .flex()
+            .items_start()
+            .justify_center()
+            .pt(px(118.0))
+            .bg(theme.scrim())
+            .child(frost::frosted(14.0, 32.0, card))
+            .into_any_element()
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let visible_summaries: Vec<SessionSummary> = match &self.search_matches {
@@ -1553,8 +1776,8 @@ impl Workspace {
                     .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |workspace, _, _, cx| {
-                            workspace.activate_spaces_menu_row(row.clone(), cx)
+                        cx.listener(move |workspace, _, window, cx| {
+                            workspace.activate_spaces_menu_row(row.clone(), window, cx)
                         }),
                     )
                     .child(
@@ -1599,9 +1822,11 @@ impl Workspace {
                 .left_0()
                 .top(px(33.0))
                 .w(px(248.0))
-                .on_key_down(cx.listener(|workspace, event: &gpui::KeyDownEvent, _, cx| {
-                    workspace.spaces_menu_key(event, cx);
-                }))
+                .on_key_down(
+                    cx.listener(|workspace, event: &gpui::KeyDownEvent, window, cx| {
+                        workspace.spaces_menu_key(event, window, cx);
+                    }),
+                )
                 .child(frost::frosted(Theme::PANEL_RADIUS, 24.0, card))
         });
 
@@ -3302,6 +3527,7 @@ impl Render for Workspace {
         let sidebar_visible = self.ui_settings.sidebar_visible;
         let context_visible = self.ui_settings.context_pane_visible;
         let terminal_visible = self.ui_settings.terminal_visible;
+        let add_space_open = self.add_space_open;
         let root = div()
             .key_context("Workspace")
             .id("workspace-root")
@@ -3404,7 +3630,8 @@ impl Render for Workspace {
                     ),
             )
             .when(context_visible, |el| el.child(self.render_context_pane(cx)))
-            .child(self.render_titlebar(cx));
+            .child(self.render_titlebar(cx))
+            .when(add_space_open, |el| el.child(self.render_add_space(cx)));
 
         motion::fade_in("phase-app", root).into_any_element()
     }
@@ -3712,5 +3939,54 @@ mod tests {
         assert_eq!(Workspace::spaces_menu_step(Some(2), 3, 1), Some(0));
         assert_eq!(Workspace::spaces_menu_step(Some(0), 3, -1), Some(2));
         assert_eq!(Workspace::spaces_menu_step(Some(1), 3, -1), Some(0));
+    }
+
+    #[test]
+    fn project_registration_persists_a_new_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let path = dir.path().join("spaces.json");
+        let mut config = SpacesConfig::local(&workspace);
+
+        let id = Workspace::register_project_space(
+            &mut config,
+            &path,
+            "Project",
+            project.to_str().unwrap(),
+        )
+        .expect("project registration succeeds");
+
+        assert_eq!(config.get(&id).unwrap().name(), "Project");
+        assert_eq!(
+            SpacesConfig::load(&path).unwrap().get(&id).unwrap().name(),
+            "Project"
+        );
+    }
+
+    #[test]
+    fn project_registration_rolls_back_when_publish_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "file").unwrap();
+        let mut config = SpacesConfig::local(&workspace);
+        let before = config.clone();
+
+        let error = Workspace::register_project_space(
+            &mut config,
+            &blocked.join("spaces.json"),
+            "Project",
+            project.to_str().unwrap(),
+        )
+        .expect_err("save path is blocked");
+
+        assert!(error.contains("Could not publish project"));
+        assert_eq!(config, before);
     }
 }
