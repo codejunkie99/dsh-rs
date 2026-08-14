@@ -109,6 +109,13 @@ struct SidebarSessionRow {
     working: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpacesMenuRow {
+    All,
+    Space(String),
+    AddSpace,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsSection {
     Providers,
@@ -138,6 +145,7 @@ pub struct Workspace {
     agent: AgentLoop,
     pub(crate) input: Entity<ChatInput>,
     search_input: Entity<ChatInput>,
+    spaces_input: Entity<ChatInput>,
     rename_input: Entity<ChatInput>,
     credential_input: Entity<ChatInput>,
     terminal_input: Entity<ChatInput>,
@@ -173,6 +181,9 @@ pub struct Workspace {
     terminal_history: TerminalHistory,
     terminal_running: bool,
     route: Route,
+    sidebar_space_filter: Option<String>,
+    spaces_menu_open: bool,
+    spaces_menu_active: Option<usize>,
     appearance_page: Option<Entity<AppearancePage>>,
     providers_page: Option<Entity<ProvidersPage>>,
     #[allow(dead_code)]
@@ -180,6 +191,40 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    fn spaces_menu_rows(spaces: &SpacesConfig, query: &str) -> Vec<SpacesMenuRow> {
+        let query = query.trim();
+        let mut rows = Vec::new();
+        if query.is_empty() {
+            rows.push(SpacesMenuRow::All);
+        }
+        rows.extend(
+            spaces
+                .spaces()
+                .iter()
+                .filter(|space| {
+                    query.is_empty() || space.name().to_lowercase().contains(&query.to_lowercase())
+                })
+                .map(|space| SpacesMenuRow::Space(space.id().to_string())),
+        );
+        rows.push(SpacesMenuRow::AddSpace);
+        rows
+    }
+
+    fn spaces_menu_step(active: Option<usize>, count: usize, delta: i32) -> Option<usize> {
+        if count == 0 {
+            return None;
+        }
+        let Some(active) = active else {
+            return Some(0);
+        };
+        let active = active as isize;
+        if active < 0 || active as usize >= count {
+            return Some(0);
+        }
+        let next = (active + delta as isize).rem_euclid(count as isize);
+        Some(next as usize)
+    }
+
     fn sidebar_session_rows(
         summaries: &[SessionSummary],
         spaces: &SpacesConfig,
@@ -233,6 +278,7 @@ impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| ChatInput::new(InputKind::Chat, cx));
         let search_input = cx.new(|cx| ChatInput::new(InputKind::Search, cx));
+        let spaces_input = cx.new(|cx| ChatInput::new(InputKind::SpaceSearch, cx));
         let rename_input = cx.new(|cx| ChatInput::new(InputKind::Rename, cx));
         let credential_input = cx.new(|cx| ChatInput::new(InputKind::ApiKey, cx));
         let terminal_input = cx.new(|cx| ChatInput::new(InputKind::Terminal, cx));
@@ -394,6 +440,7 @@ impl Workspace {
             agent,
             input,
             search_input,
+            spaces_input,
             rename_input,
             credential_input,
             terminal_input,
@@ -407,7 +454,7 @@ impl Workspace {
             ui_settings_path,
             home,
             spaces_config,
-            selected_space_id,
+            selected_space_id: selected_space_id.clone(),
             harness_setups,
             selected_harness_id,
             workspace_root,
@@ -429,6 +476,9 @@ impl Workspace {
             terminal_history: TerminalHistory::new(20),
             terminal_running: false,
             route: Route::Chat,
+            sidebar_space_filter: Some(selected_space_id.clone()),
+            spaces_menu_open: false,
+            spaces_menu_active: None,
             appearance_page: None,
             providers_page: Some(providers_page),
             providers_subscription: Some(providers_subscription),
@@ -986,6 +1036,64 @@ impl Workspace {
         cx.notify();
     }
 
+    fn close_spaces_menu(&mut self, cx: &mut Context<Self>) {
+        if self.spaces_menu_open {
+            self.spaces_menu_open = false;
+            self.spaces_menu_active = None;
+            cx.notify();
+        }
+    }
+
+    fn activate_spaces_menu_row(&mut self, row: SpacesMenuRow, cx: &mut Context<Self>) {
+        match row {
+            SpacesMenuRow::All => {
+                self.sidebar_space_filter = None;
+                self.close_spaces_menu(cx);
+            }
+            SpacesMenuRow::Space(space_id) => {
+                self.sidebar_space_filter = Some(space_id.clone());
+                self.select_space(&space_id, cx);
+                self.close_spaces_menu(cx);
+            }
+            SpacesMenuRow::AddSpace => {
+                self.status =
+                    SharedString::from("Project creation is not available in this build yet.");
+                self.close_spaces_menu(cx);
+            }
+        }
+    }
+
+    fn spaces_menu_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        if !self.spaces_menu_open {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        let query = self.spaces_input.read(cx).text();
+        let count = Self::spaces_menu_rows(&self.spaces_config, &query).len();
+        match key {
+            "escape" => self.close_spaces_menu(cx),
+            "up" => {
+                self.spaces_menu_active =
+                    Self::spaces_menu_step(self.spaces_menu_active, count, -1);
+                cx.notify();
+            }
+            "down" => {
+                self.spaces_menu_active = Self::spaces_menu_step(self.spaces_menu_active, count, 1);
+                cx.notify();
+            }
+            "enter" | "return" => {
+                let active = self.spaces_menu_active.unwrap_or(0);
+                let row = Self::spaces_menu_rows(&self.spaces_config, &query)
+                    .get(active)
+                    .cloned();
+                if let Some(row) = row {
+                    self.activate_spaces_menu_row(row, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn cycle_space(&mut self, forward: bool, cx: &mut Context<Self>) {
         if let Some(next) =
             Self::cycled_space_id(&self.spaces_config, &self.selected_space_id, forward)
@@ -1375,14 +1483,127 @@ impl Workspace {
             &visible_summaries,
             &self.spaces_config,
             &self.harness_setups,
-            Some(&self.selected_space_id),
+            self.sidebar_space_filter.as_deref(),
             chrono::Utc::now(),
         );
-        let selected_space = self
-            .spaces_config
-            .get(&self.selected_space_id)
-            .map(|space| space.name().to_string())
-            .unwrap_or_else(|| "All projects".to_string());
+        let selected_space = match self.sidebar_space_filter.as_deref() {
+            Some(space_id) => self
+                .spaces_config
+                .get(space_id)
+                .map(|space| space.name().to_string())
+                .unwrap_or_else(|| "All projects".to_string()),
+            None => "All projects".to_string(),
+        };
+        let spaces_query = self.spaces_input.read(cx).text();
+        let spaces_menu_rows = Self::spaces_menu_rows(&self.spaces_config, &spaces_query);
+        let spaces_menu_active = self
+            .spaces_menu_active
+            .filter(|index| *index < spaces_menu_rows.len());
+        let menu_row_elements = spaces_menu_rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let (label, leading) = match &row {
+                    SpacesMenuRow::All => ("All projects".to_string(), icons::FOLDER),
+                    SpacesMenuRow::Space(space_id) => (
+                        self.spaces_config
+                            .get(space_id)
+                            .map(|space| space.name().to_string())
+                            .unwrap_or_else(|| "?".to_string()),
+                        icons::FOLDER,
+                    ),
+                    SpacesMenuRow::AddSpace => ("New project...".to_string(), icons::PLUS),
+                };
+                let selected = match &row {
+                    SpacesMenuRow::All => self.sidebar_space_filter.is_none(),
+                    SpacesMenuRow::Space(space_id) => {
+                        self.sidebar_space_filter.as_deref() == Some(space_id.as_str())
+                    }
+                    SpacesMenuRow::AddSpace => false,
+                };
+                let active = spaces_menu_active == Some(index);
+                let rest_bg = if selected {
+                    theme::glass_selected_bg()
+                } else {
+                    theme.wash(0.0)
+                };
+                let hover_bg = if selected {
+                    theme::glass_selected_bg()
+                } else {
+                    theme.glass_hover()
+                };
+
+                div()
+                    .id(SharedString::from(format!("spaces-menu-row-{index}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .rounded(px(6.0))
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .text_size(px(12.5))
+                    .text_color(if selected || active {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
+                    .bg(if active { hover_bg } else { rest_bg })
+                    .hover(|style| style.bg(theme.glass_hover()))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |workspace, _, _, cx| {
+                            workspace.activate_spaces_menu_row(row.clone(), cx)
+                        }),
+                    )
+                    .child(
+                        icon(leading)
+                            .size(px(15.0))
+                            .flex_none()
+                            .text_color(theme.text_muted.opacity(0.8)),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+            })
+            .collect::<Vec<_>>();
+
+        let spaces_menu_popover = self.spaces_menu_open.then(|| {
+            let card = div()
+                .id("spaces-menu-card")
+                .w(px(248.0))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .p(px(8.0))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(self.spaces_input.clone()),
+                )
+                .child(
+                    div()
+                        .id("spaces-menu-list")
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .max_h(px(224.0))
+                        .overflow_y_scroll()
+                        .p(px(6.0))
+                        .children(menu_row_elements),
+                );
+
+            div()
+                .id("spaces-menu-popover")
+                .absolute()
+                .left_0()
+                .top(px(33.0))
+                .w(px(248.0))
+                .on_key_down(cx.listener(|workspace, event: &gpui::KeyDownEvent, _, cx| {
+                    workspace.spaces_menu_key(event, cx);
+                }))
+                .child(frost::frosted(Theme::PANEL_RADIUS, 24.0, card))
+        });
 
         let session_rows = rows.into_iter().map(|row| {
             let selected = self.selected.as_ref().is_some_and(|log| log.id() == row.id);
@@ -1521,6 +1742,7 @@ impl Workspace {
                     .pb(px(4.0))
                     .child(
                         div()
+                            .relative()
                             .id("spaces-filter")
                             .flex_1()
                             .min_w_0()
@@ -1548,7 +1770,18 @@ impl Workspace {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|workspace, _, window, cx| {
-                                    workspace.next_space(&NextSpace, window, cx)
+                                    if workspace.spaces_menu_open {
+                                        workspace.close_spaces_menu(cx);
+                                    } else {
+                                        workspace.spaces_menu_open = true;
+                                        workspace.spaces_menu_active = None;
+                                        let focus_handle = workspace
+                                            .spaces_input
+                                            .read(cx)
+                                            .focus_handle(cx)
+                                            .clone();
+                                        window.focus(&focus_handle, cx);
+                                    }
                                 }),
                             )
                             .child(
@@ -1563,7 +1796,10 @@ impl Workspace {
                                     .size(px(14.0))
                                     .flex_none()
                                     .text_color(theme.text_muted.opacity(0.6)),
-                            ),
+                            )
+                            .when_some(spaces_menu_popover, |element, popover| {
+                                element.child(popover)
+                            }),
                     )
                     .child(
                         div()
@@ -1650,367 +1886,6 @@ impl Workspace {
                     ),
             )
             .into_any_element()
-    }
-
-    #[allow(dead_code)]
-    fn render_legacy_sidebar(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let theme = Theme::of(cx).clone();
-        let visible_summaries: Vec<SessionSummary> = match &self.search_matches {
-            Some(matches) => self
-                .summaries
-                .iter()
-                .filter(|summary| matches.contains(&summary.id))
-                .cloned()
-                .collect(),
-            None => self.summaries.clone(),
-        };
-
-        div()
-            .id("sessions-sidebar")
-            .w(px(SIDEBAR_DEFAULT))
-            .h_full()
-            .flex()
-            .flex_col()
-            .pt(px(Theme::TITLEBAR_HEIGHT))
-            .bg(theme.wash(0.05))
-            .border_r_1()
-            .border_color(theme.border)
-            .overflow_scroll()
-            .p_3()
-            .gap_2()
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text_faint)
-                            .child("SPACES"),
-                    )
-                    .children(self.busy.then(|| {
-                        div()
-                            .id("cancel-turn")
-                            .px_4()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .bg(theme.danger)
-                            .text_size(px(13.))
-                            .text_color(theme.bg)
-                            .hover(|style| style.cursor_pointer())
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|workspace, _, window, cx| {
-                                    workspace.cancel_turn(&CancelTurn, window, cx)
-                                }),
-                            )
-                            .child("Cancel")
-                    }))
-                    .child(
-                        div()
-                            .id("new-session")
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(theme.accent)
-                            .text_size(px(12.))
-                            .text_color(theme.bg)
-                            .hover(|style| style.bg(theme.success).cursor_pointer())
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|workspace, _, _, cx| workspace.create_session(cx)),
-                            )
-                            .child("New"),
-                    ),
-            )
-            .children(
-                self.spaces_config
-                    .spaces()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, space)| {
-                        let id = space.id().to_string();
-                        let selected = self.selected_space_id == id;
-                        div()
-                            .id(("space", index))
-                            .w_full()
-                            .px_2()
-                            .py_2()
-                            .rounded_sm()
-                            .border_l_2()
-                            .border_color(if selected { theme.accent } else { theme.border })
-                            .bg(if selected {
-                                theme::glass_selected_bg()
-                            } else {
-                                theme.wash(0.0)
-                            })
-                            .hover(|style| style.bg(theme.glass_hover()).cursor_pointer())
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |workspace, _, _, cx| {
-                                    workspace.select_space(&id.clone(), cx)
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(theme.text)
-                                    .child(space.name().to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(theme.text_faint)
-                                    .child({
-                                        let root = space.root().display().to_string();
-                                        if root.chars().count() > 34 {
-                                            format!(
-                                                "{}...{}",
-                                                root.chars().take(18).collect::<String>(),
-                                                root.chars()
-                                                    .rev()
-                                                    .take(13)
-                                                    .collect::<Vec<_>>()
-                                                    .into_iter()
-                                                    .rev()
-                                                    .collect::<String>()
-                                            )
-                                        } else {
-                                            root
-                                        }
-                                    }),
-                            )
-                    }),
-            )
-            .child(
-                div()
-                    .pt_2()
-                    .text_size(px(13.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.text_faint)
-                    .child("HARNESS SETUPS"),
-            )
-            .children(
-                self.harness_setups
-                    .setups()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, setup)| {
-                        let id = setup.id().to_string();
-                        let selected = self.selected_harness_id == id;
-                        div()
-                            .id(("harness-setup", index))
-                            .w_full()
-                            .px_2()
-                            .py_2()
-                            .rounded_sm()
-                            .border_l_2()
-                            .border_color(if selected { theme.accent } else { theme.border })
-                            .bg(if selected {
-                                theme::glass_selected_bg()
-                            } else {
-                                theme.wash(0.0)
-                            })
-                            .hover(|style| style.bg(theme.glass_hover()).cursor_pointer())
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |workspace, _, _, cx| {
-                                    workspace.select_harness(&id.clone(), cx)
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(theme.text)
-                                    .child(setup.name().to_string()),
-                            )
-                            .child(div().text_size(px(11.)).text_color(theme.text_faint).child(
-                                format!(
-                                    "{} tools · {} max steps",
-                                    setup.enabled_tools().len(),
-                                    setup.max_steps()
-                                ),
-                            ))
-                    }),
-            )
-            .child(self.search_input.clone())
-            .child(self.rename_input.clone())
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("fork-session")
-                            .flex_1()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(theme.surface_raised)
-                            .text_size(px(12.))
-                            .text_color(theme.text)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|style| style.bg(theme.border).cursor_pointer())
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|workspace, _, _, cx| workspace.fork_selected(cx)),
-                            )
-                            .child("Fork"),
-                    )
-                    .child(
-                        div()
-                            .id("export-session")
-                            .flex_1()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(theme.surface_raised)
-                            .text_size(px(12.))
-                            .text_color(theme.success)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|style| style.bg(theme.border).cursor_pointer())
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|workspace, _, _, cx| workspace.export_selected(cx)),
-                            )
-                            .child("Export"),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text_faint)
-                            .child("MODEL ACCESS"),
-                    )
-                    .child(self.credential_input.clone())
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("save-credential")
-                                    .flex_1()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(theme.success)
-                                    .text_size(px(12.))
-                                    .text_color(theme.bg)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .hover(|style| style.bg(theme.success).cursor_pointer())
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|workspace, _, window, cx| {
-                                            workspace.save_credential(&SaveCredential, window, cx)
-                                        }),
-                                    )
-                                    .child("Save Key"),
-                            )
-                            .child(
-                                div()
-                                    .id("remove-credential")
-                                    .flex_1()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(if self.credential_file_configured {
-                                        theme.danger
-                                    } else {
-                                        theme.surface_raised
-                                    })
-                                    .text_size(px(12.))
-                                    .text_color(theme.bg)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .hover(|style| style.cursor_pointer())
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|workspace, _, _, cx| {
-                                            workspace.remove_credential(cx)
-                                        }),
-                                    )
-                                    .child("Remove"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(if self.credential_environment_override {
-                                theme.warning
-                            } else if self.credential_file_configured {
-                                theme.success
-                            } else {
-                                theme.text_faint
-                            })
-                            .child(self.credential_label()),
-                    ),
-            )
-            .children(visible_summaries.iter().map(|summary| {
-                let id = summary.id;
-                let selected = self.selected.as_ref().is_some_and(|log| log.id() == id);
-                div()
-                    .id(("session", id.as_u64_pair().1))
-                    .w_full()
-                    .px_2()
-                    .py_2()
-                    .rounded_sm()
-                    .border_l_2()
-                    .border_color(if selected { theme.accent } else { theme.border })
-                    .bg(if selected {
-                        theme::glass_selected_bg()
-                    } else {
-                        theme.wash(0.0)
-                    })
-                    .hover(|style| style.bg(theme.glass_hover()).cursor_pointer())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |workspace, _, _, cx| workspace.select(id, cx)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .text_color(theme.text)
-                            .child(summary.title.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(theme.text_faint)
-                            .child(format!(
-                                "{} · {} · {} · {} events{}",
-                                self.spaces_config
-                                    .get(summary.space_id.as_deref().unwrap_or_default())
-                                    .map(|space| space.name())
-                                    .unwrap_or("Local harness"),
-                                self.harness_setups
-                                    .get(summary.harness_id.as_deref().unwrap_or_default())
-                                    .map(|setup| setup.name())
-                                    .unwrap_or("Standard"),
-                                summary.model.as_deref().unwrap_or("no model"),
-                                summary.event_count,
-                                if summary.turn_active {
-                                    " · active"
-                                } else {
-                                    ""
-                                }
-                            )),
-                    )
-            }))
     }
 
     fn render_transcript(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2753,6 +2628,70 @@ impl Workspace {
                     .child(
                         div()
                             .flex()
+                            .flex_row()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .id("fork-session")
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .rounded(px(8.0))
+                                    .px(px(10.0))
+                                    .py(px(6.0))
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_muted)
+                                    .cursor_pointer()
+                                    .hover(|style| {
+                                        style.bg(theme.glass_hover()).text_color(theme.text)
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|workspace, _, _, cx| {
+                                            workspace.fork_selected(cx)
+                                        }),
+                                    )
+                                    .child(
+                                        icon(icons::GIT_BRANCH)
+                                            .size(px(14.0))
+                                            .text_color(theme.text_muted),
+                                    )
+                                    .child("Fork"),
+                            )
+                            .child(
+                                div()
+                                    .id("export-session")
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .rounded(px(8.0))
+                                    .px(px(10.0))
+                                    .py(px(6.0))
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_muted)
+                                    .cursor_pointer()
+                                    .hover(|style| {
+                                        style.bg(theme.glass_hover()).text_color(theme.text)
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|workspace, _, _, cx| {
+                                            workspace.export_selected(cx)
+                                        }),
+                                    )
+                                    .child(
+                                        icon(icons::DOCUMENT)
+                                            .size(px(14.0))
+                                            .text_color(theme.text_muted),
+                                    )
+                                    .child("Export"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
                             .flex_col()
                             .gap_2()
                             .child(
@@ -3028,6 +2967,9 @@ impl Workspace {
             .flex()
             .bg(theme.glass())
             .text_color(theme.text)
+            .on_action(cx.listener(|workspace, _: &SaveCredential, window, cx| {
+                workspace.save_credential(&SaveCredential, window, cx)
+            }))
             .on_action(cx.listener(|workspace, _: &CloseSettings, window, cx| {
                 workspace.close_settings(&CloseSettings, window, cx)
             }))
@@ -3724,5 +3666,51 @@ mod tests {
         assert_eq!(rows[0].harness_name, "Standard");
         assert_eq!(rows[0].time_ago, "2m");
         assert!(rows[0].working);
+    }
+
+    #[test]
+    fn spaces_menu_filters_projects_and_keeps_add_last() {
+        let local = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let spaces = SpacesConfig::parse(&format!(
+            r#"{{
+                "spaces": [
+                    {{"id":"local","name":"Local harness","root":{:?}}},
+                    {{"id":"project","name":"Project","root":{:?}}}
+                ]
+            }}"#,
+            local.path(),
+            project.path()
+        ))
+        .unwrap();
+
+        let empty = Workspace::spaces_menu_rows(&spaces, "");
+        assert_eq!(
+            empty,
+            vec![
+                SpacesMenuRow::All,
+                SpacesMenuRow::Space("local".into()),
+                SpacesMenuRow::Space("project".into()),
+                SpacesMenuRow::AddSpace,
+            ]
+        );
+
+        let filtered = Workspace::spaces_menu_rows(&spaces, "PRO");
+        assert_eq!(
+            filtered,
+            vec![
+                SpacesMenuRow::Space("project".into()),
+                SpacesMenuRow::AddSpace,
+            ]
+        );
+    }
+
+    #[test]
+    fn spaces_menu_navigation_wraps_in_both_directions() {
+        assert_eq!(Workspace::spaces_menu_step(None, 3, 1), Some(0));
+        assert_eq!(Workspace::spaces_menu_step(Some(0), 3, 1), Some(1));
+        assert_eq!(Workspace::spaces_menu_step(Some(2), 3, 1), Some(0));
+        assert_eq!(Workspace::spaces_menu_step(Some(0), 3, -1), Some(2));
+        assert_eq!(Workspace::spaces_menu_step(Some(1), 3, -1), Some(0));
     }
 }

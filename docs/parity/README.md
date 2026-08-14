@@ -17,7 +17,8 @@ The first pass identified these structural deltas:
   into the composer.
 
 The current working tree adds the real-state sidebar adapter and first
-Comet-style sidebar rows. A fresh rendered comparison is pending until the
-macOS display is unlocked; while locked, `loginwindow` is frontmost and screen
-capture returns a black frame for both the Rust app and the known-good
-packaged binary.
+Comet-style sidebar rows, plus the searchable/frosted spaces picker state and
+first popover render. The picker's Add-project flow and rendered parity check
+remain open. A fresh rendered comparison is pending until the macOS display is
+unlocked; while locked, `loginwindow` is frontmost and screen capture returns a
+black frame for both the Rust app and the known-good packaged binary.
