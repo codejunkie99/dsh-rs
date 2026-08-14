@@ -7,6 +7,12 @@ use std::path::Path;
 pub struct UiSettings {
     pub sidebar_visible: bool,
     pub context_pane_visible: bool,
+    #[serde(default = "default_terminal_visible")]
+    pub terminal_visible: bool,
+}
+
+fn default_terminal_visible() -> bool {
+    true
 }
 
 impl Default for UiSettings {
@@ -14,6 +20,7 @@ impl Default for UiSettings {
         Self {
             sidebar_visible: true,
             context_pane_visible: true,
+            terminal_visible: true,
         }
     }
 }
@@ -60,6 +67,7 @@ mod tests {
         let settings = UiSettings::default();
         assert!(settings.sidebar_visible);
         assert!(settings.context_pane_visible);
+        assert!(settings.terminal_visible);
     }
 
     #[test]
@@ -68,10 +76,20 @@ mod tests {
         let settings = UiSettings {
             sidebar_visible: false,
             context_pane_visible: false,
+            terminal_visible: false,
         };
 
         settings.save(&path).unwrap();
         assert_eq!(UiSettings::load(&path).unwrap(), settings);
         assert!(UiSettings::parse("{\"sidebar_visible\":true}").is_err());
+    }
+
+    #[test]
+    fn legacy_ui_settings_default_the_terminal_dock_to_visible() {
+        let settings =
+            UiSettings::parse(r#"{"sidebar_visible":true,"context_pane_visible":false}"#).unwrap();
+
+        assert!(settings.terminal_visible);
+        assert!(!settings.context_pane_visible);
     }
 }

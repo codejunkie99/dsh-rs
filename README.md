@@ -25,6 +25,7 @@ A native Rust + GPUI desktop milestone for the DeepSeek Harness agent model. It 
 - Keyboard space cycling with `Cmd+Shift+Right` and `Cmd+Shift+Left`.
 - Durable harness setups with prompt, tool allowlist, and step-budget primitives. New sessions and forks preserve the selected setup.
 - Keyboard harness cycling with `Cmd+Shift+Down` and `Cmd+Shift+Up`.
+- Native bottom command dock for direct, allowlisted commands with bounded output and history.
 - Durable fail-closed approval policy with native GPUI Approve/Deny prompts for `ask` tools.
 - Responsive turn cancellation with a durable cancelled turn event and native Cancel control.
 - Optional direct-execution shell tool with canonical binary allowlist, cleared environment, workspace cwd, timeout, and bounded output.
@@ -134,6 +135,24 @@ The native shell uses a dense dark three-pane layout adapted from the MIT-licens
 
 Pane visibility persists in `~/.dsh-rs/ui.json`. Press `Cmd+S` to toggle the left rail and `Cmd+B` to toggle the context pane.
 
+## Command Dock
+
+The bottom center dock runs one direct command at a time in the selected space:
+
+- Press `Cmd+T` to show or hide the dock.
+- Press `Cmd+Shift+T` to focus the command field.
+- Type an allowlisted executable path plus direct arguments.
+- Press `Enter` or click **Run**.
+- Keep the newest 20 command results in bounded history.
+
+For example, after adding `/bin/echo` to the shell policy below:
+
+```text
+/bin/echo "native command dock"
+```
+
+The dock uses the same canonical executable allowlist, selected-space cwd, empty environment, timeout, output cap, and kill-on-limit behavior as the model shell tool. Commands are parsed into direct argv values; no `/bin/sh` is invoked. This is a real direct-command workflow, but it is not yet an interactive PTY terminal.
+
 The Git scanner is UI-only and read-only. It invokes `/usr/bin/git` directly with an empty environment, disables optional locks, fsmonitor, paging, and terminal prompts, and applies a five-second timeout. File paths are rejected if they are absolute or traverse outside the repository. Diff rendering is capped at 500 lines and long lines are truncated. Git data is not exposed to model tools by this scanner.
 
 ## System prompt
@@ -236,5 +255,6 @@ This build uses GPUI's `runtime_shaders` feature so it can build and run with th
 
 - Remote streaming retries are implemented, but circuit-break telemetry is not implemented yet.
 - The editor is a focused native single-line chat input, not a full multiline code editor.
+- The command dock is direct-execution only; interactive PTY sessions and terminal multiplexing are future work.
 - Harness setups are selectable and durable, but setup authoring is JSON-file based rather than a full visual editor.
 - Read/list/write filesystem tools are scoped and enabled according to the selected setup. Shell execution is direct-execution and explicitly allowlisted, not a general `/bin/sh` sandbox. OS-level sandbox profiles remain future work.
