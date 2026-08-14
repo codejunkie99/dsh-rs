@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::prompt::SystemPromptConfig;
 
-pub const SUPPORTED_TOOLS: [&str; 8] = [
+pub const SUPPORTED_TOOLS: [&str; 10] = [
     "echo",
     "read",
     "list_dir",
@@ -14,6 +14,8 @@ pub const SUPPORTED_TOOLS: [&str; 8] = [
     "run_command",
     "todo_write",
     "skill",
+    "glob",
+    "grep",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +118,8 @@ impl Default for HarnessSetupsConfig {
                         "list_dir".into(),
                         "write".into(),
                         "edit".into(),
+                        "glob".into(),
+                        "grep".into(),
                         "run_command".into(),
                         "todo_write".into(),
                         "skill".into(),
