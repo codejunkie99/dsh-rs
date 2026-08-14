@@ -5,6 +5,7 @@ use parking_lot::RwLock;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -52,6 +53,7 @@ pub struct SessionLog {
     id: Uuid,
     path: Option<PathBuf>,
     inner: RwLock<SessionInner>,
+    sequence_tx: watch::Sender<u64>,
 }
 
 #[derive(Debug)]
@@ -73,6 +75,7 @@ impl SessionLog {
         Self {
             id: session_id,
             path,
+            sequence_tx: watch::Sender::new(0),
             inner: RwLock::new(SessionInner {
                 events: Vec::new(),
                 title: "New session".into(),
@@ -94,6 +97,14 @@ impl SessionLog {
         let log = Self::with_path(session_id, Some(path.clone()));
         if path.exists() {
             log.replay_from_disk()?;
+            let latest = log
+                .inner
+                .read()
+                .events
+                .last()
+                .map(|event| event.seq)
+                .unwrap_or(0);
+            log.sequence_tx.send(latest).ok();
         }
         Ok(log)
     }
@@ -128,6 +139,10 @@ impl SessionLog {
             .collect()
     }
 
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.sequence_tx.subscribe()
+    }
+
     pub fn append(&self, kind: EventKind) -> Result<SessionEvent> {
         self.append_with_metadata(kind, Default::default())
     }
@@ -153,6 +168,7 @@ impl SessionLog {
             event
         };
         self.persist_append(&event)?;
+        self.sequence_tx.send(event.seq).ok();
         Ok(event)
     }
 
@@ -363,5 +379,22 @@ mod tests {
         }
         assert_eq!(log.events_after(3).len(), 2);
         assert_eq!(log.events_after(3)[0].seq, 4);
+    }
+
+    #[tokio::test]
+    async fn append_notifies_subscribers_with_latest_sequence() {
+        let log = SessionLog::in_memory(Uuid::new_v4());
+        let mut sequence = log.subscribe();
+
+        log.append(EventKind::TurnStarted).unwrap();
+        sequence.changed().await.unwrap();
+        assert_eq!(*sequence.borrow(), 1);
+
+        log.append(EventKind::TurnCompleted {
+            reason: TurnCompletionReason::Natural,
+        })
+        .unwrap();
+        sequence.changed().await.unwrap();
+        assert_eq!(*sequence.borrow(), 2);
     }
 }

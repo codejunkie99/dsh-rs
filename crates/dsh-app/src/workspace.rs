@@ -215,14 +215,30 @@ impl Workspace {
         let agent = self.agent.clone();
         let cancellation_for_turn = cancellation;
         let workspace = cx.entity();
+        let mut sequence = log.subscribe();
         cx.spawn(async move |_, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    agent
-                        .run_turn_with_cancellation(log, text, cancellation_for_turn)
-                        .await
-                })
-                .await;
+            let turn = cx.background_spawn(async move {
+                agent
+                    .run_turn_with_cancellation(log, text, cancellation_for_turn)
+                    .await
+            });
+            let mut turn = std::pin::pin!(turn);
+            let result = loop {
+                tokio::select! {
+                    result = &mut *turn => break result,
+                    changed = sequence.changed() => {
+                        if changed.is_ok() {
+                            let _ = cx.update(|cx| {
+                                workspace.update(cx, |workspace, cx| {
+                                    workspace.refresh();
+                                    cx.notify();
+                                });
+                            });
+                        }
+                    }
+                }
+            };
+
             let _ = cx.update(|cx| {
                 workspace.update(cx, |workspace, cx| {
                     workspace.busy = false;

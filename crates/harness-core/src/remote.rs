@@ -252,6 +252,24 @@ fn function_tool(tool: &ToolSchema) -> Value {
     })
 }
 
+fn retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status.as_u16() >= 500
+}
+
+fn retry_delay(response: &reqwest::Response, attempt: u32) -> Duration {
+    let fallback = Duration::from_millis(50_u64.saturating_mul(1_u64 << attempt.min(5)));
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|seconds: &f64| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| Duration::from_secs_f64(seconds.clamp(0.0, 30.0)))
+        .unwrap_or(fallback)
+}
+
 #[async_trait]
 impl LlmAdapter for OpenAiCompatibleAdapter {
     async fn stream(&self, request: LlmRequest) -> Result<mpsc::Receiver<StreamFrame>> {
@@ -272,16 +290,71 @@ impl LlmAdapter for OpenAiCompatibleAdapter {
         MODEL_RUNTIME
             .get_or_init(|| Runtime::new().expect("failed to start model runtime"))
             .spawn(async move {
-                let response = match client.execute(request).await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        let _ = tx
-                            .send(StreamFrame::Error {
-                                message: format!("model request failed: {error}"),
-                            })
+                let mut response = None;
+                for attempt in 0_u32..3 {
+                    let executable = match request.try_clone() {
+                        Some(request) => request,
+                        None => {
+                            let _ = tx
+                                .send(StreamFrame::Error {
+                                    message: "model request is not retryable".into(),
+                                })
+                                .await;
+                            return;
+                        }
+                    };
+
+                    match client.execute(executable).await {
+                        Ok(candidate) => {
+                            if candidate.status().is_success() {
+                                response = Some(candidate);
+                                break;
+                            }
+
+                            let status = candidate.status();
+                            let delay = retry_delay(&candidate, attempt);
+                            let detail = candidate
+                                .text()
+                                .await
+                                .unwrap_or_else(|error| format!("unreadable error body: {error}"));
+                            if !retryable_status(status) || attempt == 2 {
+                                let _ = tx
+                                    .send(StreamFrame::Error {
+                                        message: format!(
+                                            "model request failed with {status}: {detail}"
+                                        ),
+                                    })
+                                    .await;
+                                return;
+                            }
+                            tokio::time::sleep(delay).await;
+                        }
+                        Err(error) => {
+                            if attempt == 2 {
+                                let _ = tx
+                                    .send(StreamFrame::Error {
+                                        message: format!(
+                                            "model request failed after retries: {error}"
+                                        ),
+                                    })
+                                    .await;
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(
+                                50_u64.saturating_mul(1_u64 << attempt.min(5)),
+                            ))
                             .await;
-                        return;
+                        }
                     }
+                }
+
+                let Some(response) = response else {
+                    let _ = tx
+                        .send(StreamFrame::Error {
+                            message: "model request exhausted retries".into(),
+                        })
+                        .await;
+                    return;
                 };
 
                 if !response.status().is_success() {
@@ -828,6 +901,97 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn openai_adapter_retries_transient_http_failures() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (requests_tx, requests_rx) = mpsc::channel::<usize>();
+
+        std::thread::spawn(move || {
+            let mut accepted = 0;
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    let count = socket.read(&mut chunk).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..count]);
+                    let Some(headers_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..headers_end]).to_string();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            (name.eq_ignore_ascii_case("content-length"))
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= headers_end + content_length {
+                        break;
+                    }
+                }
+                accepted += 1;
+                requests_tx.send(accepted).unwrap();
+
+                if accepted == 1 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 0\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+                        )
+                        .unwrap();
+                } else {
+                    let event = json!({
+                        "choices": [{"delta": {"content": "after retry"}}]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {event}\n\ndata: [DONE]\n\n"
+                    );
+                    socket.write_all(response.as_bytes()).unwrap();
+                }
+                socket.flush().unwrap();
+            }
+        });
+
+        let adapter = super::OpenAiCompatibleAdapter::new(
+            format!("http://127.0.0.1:{port}"),
+            super::ApiKey::new("sk_test_retry"),
+            "deepseek-chat".into(),
+        )
+        .unwrap();
+        let mut stream = adapter
+            .stream(LlmRequest {
+                messages: vec![ChatMessage::User {
+                    content: "retry".into(),
+                }],
+                tools: Vec::new(),
+                model: Some("deepseek-chat".into()),
+                metadata: Default::default(),
+            })
+            .await
+            .unwrap();
+
+        let mut frames = Vec::new();
+        while let Some(frame) = stream.recv().await {
+            frames.push(frame);
+        }
+        assert_eq!(requests_rx.recv().unwrap(), 1);
+        assert_eq!(requests_rx.recv().unwrap(), 2);
+        assert!(matches!(
+            frames.first(),
+            Some(crate::llm::StreamFrame::Delta { text, .. }) if text == "after retry"
+        ));
     }
 
     #[test]
