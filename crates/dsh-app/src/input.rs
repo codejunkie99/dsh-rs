@@ -53,6 +53,7 @@ pub enum InputKind {
     Search,
     Rename,
     ApiKey,
+    Terminal,
 }
 
 impl InputKind {
@@ -62,6 +63,7 @@ impl InputKind {
             Self::Search => "SearchInput",
             Self::Rename => "RenameInput",
             Self::ApiKey => "ApiKeyInput",
+            Self::Terminal => "TerminalInput",
         }
     }
 
@@ -71,6 +73,7 @@ impl InputKind {
             Self::Search => "Search sessions",
             Self::Rename => "Session title",
             Self::ApiKey => "DeepSeek API key",
+            Self::Terminal => "Allowlisted direct command",
         }
     }
 

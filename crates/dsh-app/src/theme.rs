@@ -4,6 +4,7 @@ pub const SIDEBAR_WIDTH: f32 = 256.0;
 pub const CONTEXT_PANE_WIDTH: f32 = 420.0;
 pub const HEADER_HEIGHT: f32 = 44.0;
 pub const STATUS_HEIGHT: f32 = 24.0;
+pub const TERMINAL_DOCK_HEIGHT: f32 = 220.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Theme {

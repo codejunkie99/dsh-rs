@@ -1,6 +1,7 @@
 mod changes;
 mod input;
 mod settings;
+mod terminal;
 mod theme;
 mod workspace;
 
@@ -12,8 +13,9 @@ use input::{
     Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft, SelectRight,
 };
 use workspace::{
-    CancelTurn, NewSession, NextHarness, NextSpace, PreviousHarness, PreviousSpace, RenameSession,
-    SaveCredential, SearchSessions, Submit, ToggleContext, ToggleSidebar, Workspace,
+    CancelTurn, FocusTerminal, NewSession, NextHarness, NextSpace, PreviousHarness, PreviousSpace,
+    RenameSession, RunTerminalCommand, SaveCredential, SearchSessions, Submit, ToggleContext,
+    ToggleSidebar, ToggleTerminal, Workspace,
 };
 
 const APP_TITLE: &str = "DeepSeek Harness RS";
@@ -26,10 +28,13 @@ fn main() {
             KeyBinding::new("enter", SearchSessions, Some("SearchInput")),
             KeyBinding::new("enter", RenameSession, Some("RenameInput")),
             KeyBinding::new("enter", SaveCredential, Some("ApiKeyInput")),
+            KeyBinding::new("enter", RunTerminalCommand, Some("TerminalInput")),
             KeyBinding::new("cmd-n", NewSession, Some("Workspace")),
             KeyBinding::new("cmd-.", CancelTurn, Some("Workspace")),
             KeyBinding::new("cmd-s", ToggleSidebar, Some("Workspace")),
             KeyBinding::new("cmd-b", ToggleContext, Some("Workspace")),
+            KeyBinding::new("cmd-t", ToggleTerminal, Some("Workspace")),
+            KeyBinding::new("cmd-shift-t", FocusTerminal, Some("Workspace")),
             KeyBinding::new("cmd-shift-right", NextSpace, Some("Workspace")),
             KeyBinding::new("cmd-shift-left", PreviousSpace, Some("Workspace")),
             KeyBinding::new("cmd-shift-down", NextHarness, Some("Workspace")),

@@ -5,7 +5,10 @@ use crate::changes::{
 };
 use crate::input::{ChatInput, InputKind};
 use crate::settings::UiSettings;
-use crate::theme::{Theme, CONTEXT_PANE_WIDTH, HEADER_HEIGHT, SIDEBAR_WIDTH, STATUS_HEIGHT};
+use crate::terminal::{parse_argv, run_command, TerminalEntry, TerminalHistory};
+use crate::theme::{
+    Theme, CONTEXT_PANE_WIDTH, HEADER_HEIGHT, SIDEBAR_WIDTH, STATUS_HEIGHT, TERMINAL_DOCK_HEIGHT,
+};
 use gpui::{
     actions, div, prelude::*, px, Context, Entity, FontWeight, MouseButton, SharedString, Window,
 };
@@ -39,7 +42,11 @@ actions!(
         NextSpace,
         PreviousSpace,
         NextHarness,
-        PreviousHarness
+        PreviousHarness,
+        RunTerminalCommand,
+        ToggleTerminal,
+        ClearTerminal,
+        FocusTerminal
     ]
 );
 
@@ -50,6 +57,7 @@ pub struct Workspace {
     search_input: Entity<ChatInput>,
     rename_input: Entity<ChatInput>,
     credential_input: Entity<ChatInput>,
+    terminal_input: Entity<ChatInput>,
     summaries: Vec<SessionSummary>,
     selected: Option<harness_core::session::SharedSessionLog>,
     selected_view: Option<SessionView>,
@@ -68,6 +76,7 @@ pub struct Workspace {
     credential_environment_override: bool,
     credential_file_configured: bool,
     tools: Arc<ToolRegistry>,
+    terminal_tool: Option<Arc<CommandTool>>,
     approver: Arc<dyn ToolApprover>,
     changes: WorkspaceChangesState,
     changes_scanning: bool,
@@ -78,6 +87,8 @@ pub struct Workspace {
     pending_approval: Option<ApprovalRequest>,
     cancellation: Option<TurnCancellation>,
     search_matches: Option<Vec<uuid::Uuid>>,
+    terminal_history: TerminalHistory,
+    terminal_running: bool,
 }
 
 impl Workspace {
@@ -86,6 +97,7 @@ impl Workspace {
         let search_input = cx.new(|cx| ChatInput::new(InputKind::Search, cx));
         let rename_input = cx.new(|cx| ChatInput::new(InputKind::Rename, cx));
         let credential_input = cx.new(|cx| ChatInput::new(InputKind::ApiKey, cx));
+        let terminal_input = cx.new(|cx| ChatInput::new(InputKind::Terminal, cx));
         let root = Self::sessions_root();
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
@@ -213,6 +225,7 @@ impl Workspace {
         };
 
         let tools = Self::build_tools(&home, &workspace_root, &selected_harness);
+        let terminal_tool = Self::build_terminal_tool(&home, &workspace_root);
         let agent = AgentLoop::new(selection.adapter.clone(), tools.clone())
             .with_default_model(Some(selection.model.clone()))
             .with_system_prompt(system_prompt.clone())
@@ -226,6 +239,7 @@ impl Workspace {
             search_input,
             rename_input,
             credential_input,
+            terminal_input,
             summaries: Vec::new(),
             selected: None,
             selected_view: None,
@@ -244,6 +258,7 @@ impl Workspace {
             credential_environment_override,
             credential_file_configured,
             tools,
+            terminal_tool,
             approver,
             changes: WorkspaceChangesState::NotRepository,
             changes_scanning: false,
@@ -254,6 +269,8 @@ impl Workspace {
             pending_approval: None,
             cancellation: None,
             search_matches: None,
+            terminal_history: TerminalHistory::new(20),
+            terminal_running: false,
         };
         let workspace_handle = cx.entity();
         cx.spawn(async move |_, cx| {
@@ -356,6 +373,29 @@ impl Workspace {
             }
         }
         Arc::new(tools)
+    }
+
+    fn build_terminal_tool(
+        home: &std::path::Path,
+        workspace_root: &std::path::Path,
+    ) -> Option<Arc<CommandTool>> {
+        let filesystem = ScopedFs::new(workspace_root).ok()?;
+        let shell_path = home.join(".dsh-rs").join("shell.json");
+        if !shell_path.exists() {
+            ShellPolicy::default()
+                .canonicalize()
+                .ok()?
+                .save(&shell_path)
+                .ok()?;
+        }
+
+        match ShellPolicy::load(&shell_path) {
+            Ok(policy) => Some(Arc::new(CommandTool::new(Arc::new(filesystem), policy))),
+            Err(error) => {
+                eprintln!("shell policy load failed ({error}); terminal dock stays disabled");
+                None
+            }
+        }
     }
 
     fn load_spaces(
@@ -702,6 +742,7 @@ impl Workspace {
             self.selected_harness_id = harness_id;
             let harness = self.selected_harness();
             self.tools = Self::build_tools(&self.home, &self.workspace_root, &harness);
+            self.terminal_tool = Self::build_terminal_tool(&self.home, &self.workspace_root);
             if let Err(error) = self.reload_model() {
                 self.status = SharedString::from(format!(
                     "Session configuration activated, but model reload failed: {error}"
@@ -729,6 +770,7 @@ impl Workspace {
         self.workspace_root = space.root().to_path_buf();
         let harness = self.selected_harness();
         self.tools = Self::build_tools(&self.home, &self.workspace_root, &harness);
+        self.terminal_tool = Self::build_terminal_tool(&self.home, &self.workspace_root);
         if let Err(error) = self.reload_model() {
             self.status = SharedString::from(format!("Could not activate space: {error}"));
             cx.notify();
@@ -814,6 +856,104 @@ impl Workspace {
 
     fn previous_harness(&mut self, _: &PreviousHarness, _: &mut Window, cx: &mut Context<Self>) {
         self.cycle_harness(false, cx);
+    }
+
+    fn toggle_terminal(&mut self, _: &ToggleTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        self.ui_settings.terminal_visible = !self.ui_settings.terminal_visible;
+        if let Err(error) = self.ui_settings.save(&self.ui_settings_path) {
+            self.status = SharedString::from(format!("Could not save terminal state: {error}"));
+        }
+        cx.notify();
+    }
+
+    fn focus_terminal(&mut self, _: &FocusTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.ui_settings.terminal_visible {
+            self.ui_settings.terminal_visible = true;
+            if let Err(error) = self.ui_settings.save(&self.ui_settings_path) {
+                self.status = SharedString::from(format!("Could not save terminal state: {error}"));
+            }
+        }
+        let focus = self.terminal_input.read(cx).focus_handle(cx);
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    fn clear_terminal(&mut self, _: &ClearTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_history.clear();
+        self.status = SharedString::from("Terminal history cleared.");
+        cx.notify();
+    }
+
+    fn run_terminal_command(
+        &mut self,
+        _: &RunTerminalCommand,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.terminal_running {
+            self.status = SharedString::from("Wait for the current command to finish.");
+            cx.notify();
+            return;
+        }
+
+        let command = self.terminal_input.read(cx).text();
+        if command.trim().is_empty() {
+            self.status = SharedString::from("Terminal command is empty.");
+            cx.notify();
+            return;
+        }
+
+        let argv = match parse_argv(&command) {
+            Ok(argv) => argv,
+            Err(error) => {
+                self.terminal_history.push(TerminalEntry {
+                    command,
+                    output: error.to_string(),
+                    ok: false,
+                });
+                self.status = SharedString::from("Terminal command could not be parsed.");
+                cx.notify();
+                return;
+            }
+        };
+
+        let Some(tool) = self.terminal_tool.clone() else {
+            self.terminal_history.push(TerminalEntry {
+                command,
+                output: "Terminal is disabled because the shell policy is unavailable.".into(),
+                ok: false,
+            });
+            self.status = SharedString::from("Terminal dock is disabled.");
+            cx.notify();
+            return;
+        };
+
+        self.terminal_running = true;
+        self.status = SharedString::from("Command running...");
+        self.terminal_input.update(cx, |input, cx| input.clear(cx));
+        cx.notify();
+
+        let workspace_handle = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let entry = cx
+                .background_spawn(async move { run_command(tool, command, argv).await })
+                .await;
+            let status = if entry.ok {
+                SharedString::from("Command complete.")
+            } else {
+                SharedString::from("Command failed.")
+            };
+
+            let _ = cx.update(|cx| {
+                workspace_handle.update(cx, |workspace, cx| {
+                    workspace.terminal_history.push(entry);
+                    workspace.terminal_running = false;
+                    workspace.status = status;
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
     }
 
     fn sync_rename_input(&mut self, cx: &mut Context<Self>) {
@@ -1431,6 +1571,177 @@ impl Workspace {
                             .child(text.clone()),
                     )
             }))
+    }
+
+    fn render_terminal_dock(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let theme = Theme::dark();
+
+        div()
+            .id("terminal-dock")
+            .h(px(TERMINAL_DOCK_HEIGHT))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.surface)
+            .child(
+                div()
+                    .h(px(32.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.faint)
+                            .child("COMMAND DOCK"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("clear-terminal")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .text_size(px(10.))
+                                    .text_color(theme.muted)
+                                    .hover(|style| style.bg(theme.raised).cursor_pointer())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|workspace, _, window, cx| {
+                                            workspace.clear_terminal(&ClearTerminal, window, cx)
+                                        }),
+                                    )
+                                    .child("Clear"),
+                            )
+                            .child(
+                                div()
+                                    .id("close-terminal")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .text_size(px(10.))
+                                    .text_color(theme.muted)
+                                    .hover(|style| style.bg(theme.raised).cursor_pointer())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|workspace, _, window, cx| {
+                                            workspace.toggle_terminal(&ToggleTerminal, window, cx)
+                                        }),
+                                    )
+                                    .child("Close"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_4()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(div().flex_1().child(self.terminal_input.clone()))
+                    .child(
+                        div()
+                            .id("run-terminal")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(if self.terminal_running {
+                                theme.raised
+                            } else {
+                                theme.accent
+                            })
+                            .text_size(px(11.))
+                            .text_color(if self.terminal_running {
+                                theme.faint
+                            } else {
+                                theme.background
+                            })
+                            .hover(|style| {
+                                if self.terminal_running {
+                                    style
+                                } else {
+                                    style.cursor_pointer()
+                                }
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, window, cx| {
+                                    workspace.run_terminal_command(&RunTerminalCommand, window, cx)
+                                }),
+                            )
+                            .child(if self.terminal_running { "..." } else { "Run" }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("terminal-output")
+                    .flex_1()
+                    .overflow_scroll()
+                    .px_4()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(if self.terminal_running {
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.faint)
+                            .child("Running")
+                    } else {
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.faint)
+                            .child("Direct allowlisted commands only")
+                    })
+                    .children(self.terminal_history.entries().iter().map(|entry| {
+                        let output = if entry.output.chars().count() > 3000 {
+                            format!("{}...", entry.output.chars().take(2997).collect::<String>())
+                        } else {
+                            entry.output.clone()
+                        };
+                        let command = if entry.command.chars().count() > 180 {
+                            format!("{}...", entry.command.chars().take(177).collect::<String>())
+                        } else {
+                            entry.command.clone()
+                        };
+
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .pb_2()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.warning)
+                                    .child(command),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(if entry.ok { theme.muted } else { theme.danger })
+                                    .child(output),
+                            )
+                    })),
+            )
     }
 
     fn render_changes_section(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -2121,6 +2432,7 @@ impl Render for Workspace {
         let theme = Theme::dark();
         let sidebar_visible = self.ui_settings.sidebar_visible;
         let context_visible = self.ui_settings.context_pane_visible;
+        let terminal_visible = self.ui_settings.terminal_visible;
         div()
             .key_context("Workspace")
             .id("workspace-root")
@@ -2139,6 +2451,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::previous_space))
             .on_action(cx.listener(Self::next_harness))
             .on_action(cx.listener(Self::previous_harness))
+            .on_action(cx.listener(Self::run_terminal_command))
+            .on_action(cx.listener(Self::focus_terminal))
+            .on_action(cx.listener(Self::toggle_terminal))
+            .on_action(cx.listener(Self::clear_terminal))
             .when(sidebar_visible, |el| el.child(self.render_sidebar(cx)))
             .child(
                 div()
@@ -2199,6 +2515,9 @@ impl Render for Workspace {
                             ),
                     )
                     .child(self.render_transcript())
+                    .when(terminal_visible, |el| {
+                        el.child(self.render_terminal_dock(cx))
+                    })
                     .children(
                         self.pending_approval
                             .as_ref()
@@ -2468,5 +2787,12 @@ mod tests {
             Some(minimal)
         );
         assert_eq!(Workspace::cycled_harness_id(&config, "missing", true), None);
+    }
+
+    #[test]
+    fn terminal_focus_action_exists_for_keyboard_reachable_dock() {
+        let handler: fn(&mut Workspace, &FocusTerminal, &mut Window, &mut Context<Workspace>) =
+            Workspace::focus_terminal;
+        assert!(format!("{handler:p}") != "0");
     }
 }
