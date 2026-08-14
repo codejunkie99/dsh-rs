@@ -25,8 +25,8 @@ Rust mapping when one exists.
 | `write` (`file_path`, `content`, sandbox fields) | `tool-fs/src/write.ts` | partial | `tools::fs::WriteFileTool` (`write`: canonical name/schema; sandbox escalation and structured diff metadata remain) |
 | `read` (`file_path`, `offset`, `limit`, line-numbered window) | `tool-fs/src/read.ts`, `tool-fs/src/read-render.ts` | partial | `tools::fs::ReadFileTool` (`read`: canonical schema, 1-based windows, line numbers, 2,000-line/2,000-char/50 KiB caps; streaming and structured result metadata remain) |
 | `read_image` (conditional on attachments) | `tool-fs/src/read-image.ts` | missing | none |
-| `glob` (`tool-fs-search/src/glob.ts`) | `tool-fs-search/src/glob.ts` | missing | none |
-| `grep` (`tool-fs-search/src/grep.ts`) | `tool-fs-search/src/grep.ts` | missing | none |
+| `glob` (`tool-fs-search/src/glob.ts`) | `tool-fs-search/src/glob.ts` | partial | `tools::search::GlobTool` (scoped recursive matcher, VCS exclusion, 100-result cap; sampling/spill persistence remain) |
+| `grep` (`tool-fs-search/src/grep.ts`) | `tool-fs-search/src/grep.ts` | partial | `tools::search::GrepTool` (scoped bounded line matches and include glob; ripgrep regex/spill persistence remain) |
 | `str_replace_editor` | `tool-str-replace-editor/src/index.ts` | missing | none |
 | `fs/observed` + read-before-write guard | `fs-observation-policy/src/index.ts` | missing | skill provider has `observe_fs_event`; tool-level `fs/observed` emission absent |
 | sandbox escalation (`sandbox_permissions`, `justification`) | `tool-fs/src/sandbox.ts`, `fs-sandbox/src/containment.ts` | missing | `ScopedFs` is root-confined; no escalation fields |
