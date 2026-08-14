@@ -25,6 +25,7 @@ use harness_core::approval::{
     ApprovalPolicy, ApprovalRequest, ChannelApprover, GatedApprover, ToolApprover,
 };
 use harness_core::cancellation::TurnCancellation;
+use harness_core::events::{TodoItem, TodoStatus};
 use harness_core::harness::{HarnessSetup, HarnessSetupsConfig};
 use harness_core::prompt::SystemPromptConfig;
 use harness_core::remote::{CredentialStore, ModelSelection};
@@ -182,6 +183,7 @@ pub struct Workspace {
     search_matches: Option<Vec<uuid::Uuid>>,
     terminal_history: TerminalHistory,
     terminal_running: bool,
+    todo_panel_collapsed: bool,
     route: Route,
     sidebar_space_filter: Option<String>,
     spaces_menu_open: bool,
@@ -227,6 +229,46 @@ impl Workspace {
         }
         let next = (active + delta as isize).rem_euclid(count as isize);
         Some(next as usize)
+    }
+
+    fn todo_items_from_arguments(arguments: &serde_json::Value) -> Option<Vec<TodoItem>> {
+        let items = arguments.get("todos")?.clone();
+        serde_json::from_value(items).ok()
+    }
+
+    fn todo_call_summary(arguments: &serde_json::Value) -> Option<String> {
+        let todos = Self::todo_items_from_arguments(arguments)?;
+        let done = todos
+            .iter()
+            .filter(|todo| todo.status == TodoStatus::Completed)
+            .count();
+        Some(format!("{done}/{} done", todos.len()))
+    }
+
+    fn todo_panel_progress(todos: &[TodoItem]) -> String {
+        let done = todos
+            .iter()
+            .filter(|todo| todo.status == TodoStatus::Completed)
+            .count();
+        let in_progress = todos
+            .iter()
+            .filter(|todo| todo.status == TodoStatus::InProgress)
+            .count();
+        let pending = todos
+            .iter()
+            .filter(|todo| todo.status == TodoStatus::Pending)
+            .count();
+        let mut segments = Vec::new();
+        if done > 0 {
+            segments.push(format!("{done} completed"));
+        }
+        if in_progress > 0 {
+            segments.push(format!("{in_progress} in progress"));
+        }
+        if pending > 0 {
+            segments.push(format!("{pending} pending"));
+        }
+        segments.join("\u{2002}·\u{2002}")
     }
 
     fn register_project_space(
@@ -500,6 +542,7 @@ impl Workspace {
             search_matches: None,
             terminal_history: TerminalHistory::new(20),
             terminal_running: false,
+            todo_panel_collapsed: true,
             route: Route::Chat,
             sidebar_space_filter: Some(selected_space_id.clone()),
             spaces_menu_open: false,
@@ -1694,6 +1737,212 @@ impl Workspace {
             .into_any_element()
     }
 
+    fn render_todo_call(arguments: &serde_json::Value, theme: &Theme) -> AnyElement {
+        let todos = Self::todo_items_from_arguments(arguments).unwrap_or_default();
+        let summary = Self::todo_call_summary(arguments).unwrap_or_else(|| "0/0 done".to_string());
+
+        div()
+            .id("todo-tool-card")
+            .max_w(px(820.0))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(theme.surface_raised)
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(7.0))
+                    .child(
+                        icon(icons::CHECKLIST)
+                            .size(px(13.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.text_faint)
+                            .child("Todo"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(summary)),
+                    ),
+            )
+            .children(todos.iter().map(|todo| {
+                let (marker, color) = match todo.status {
+                    TodoStatus::Completed => ("[x]", theme.text_muted),
+                    TodoStatus::InProgress => ("[ ]", theme.text),
+                    TodoStatus::Pending => ("[ ]", theme.text_muted.opacity(0.8)),
+                };
+                div()
+                    .text_size(px(12.0))
+                    .font_family(theme.font_mono.clone())
+                    .text_color(color)
+                    .child(format!("{marker} {}", todo.content))
+            }))
+            .into_any_element()
+    }
+
+    fn render_todo_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let todos = self
+            .selected_view
+            .as_ref()
+            .and_then(|view| view.todos.clone())?;
+        if todos.is_empty() {
+            return None;
+        }
+
+        let theme = Theme::of(cx).clone();
+        let collapsed = self.todo_panel_collapsed;
+        let progress = Self::todo_panel_progress(&todos);
+        let card = div()
+            .id("todo-panel-card")
+            .w_full()
+            .max_w(px(820.0))
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("todo-panel-header")
+                    .min_h(px(36.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(12.0))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|workspace, _, _, cx| {
+                            workspace.todo_panel_collapsed = !workspace.todo_panel_collapsed;
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        icon(icons::CHECKLIST)
+                            .size(px(14.0))
+                            .flex_none()
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(13.0))
+                            .line_height(px(24.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child("To-dos"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(13.0))
+                            .line_height(px(20.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(progress)),
+                    )
+                    .child(
+                        icon(icons::ALT_ARROW_DOWN)
+                            .size(px(14.0))
+                            .flex_none()
+                            .text_color(theme.text_muted),
+                    ),
+            )
+            .when(!collapsed, |element| {
+                element.child(
+                    div()
+                        .id("todo-panel-list")
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .max_h(px(180.0))
+                        .overflow_y_scroll()
+                        .px(px(12.0))
+                        .pb(px(10.0))
+                        .children(todos.iter().map(|todo| {
+                            let (glyph, color) = match todo.status {
+                                TodoStatus::Completed => (
+                                    icon(icons::CHECK)
+                                        .size(px(14.0))
+                                        .text_color(theme.success)
+                                        .into_any_element(),
+                                    theme.text_muted,
+                                ),
+                                TodoStatus::InProgress => (
+                                    div()
+                                        .size(px(14.0))
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(theme.accent)
+                                        .into_any_element(),
+                                    theme.text,
+                                ),
+                                TodoStatus::Pending => (
+                                    div()
+                                        .size(px(14.0))
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(theme.text_faint.opacity(0.7))
+                                        .into_any_element(),
+                                    theme.text_muted,
+                                ),
+                            };
+
+                            div()
+                                .id(SharedString::from(format!(
+                                    "todo-panel-item-{}",
+                                    todo.content
+                                )))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(10.0))
+                                .min_w_0()
+                                .text_size(px(13.0))
+                                .line_height(px(20.0))
+                                .text_color(color)
+                                .child(
+                                    div()
+                                        .size(px(16.0))
+                                        .flex()
+                                        .flex_none()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(glyph),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .child(todo.content.clone()),
+                                )
+                        })),
+                )
+            });
+
+        Some(
+            div()
+                .id("todo-panel")
+                .w_full()
+                .flex()
+                .flex_none()
+                .justify_center()
+                .px_6()
+                .pb_2()
+                .child(frost::frosted(12.0, 24.0, card))
+                .into_any_element(),
+        )
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let visible_summaries: Vec<SessionSummary> = match &self.search_matches {
@@ -2133,6 +2382,14 @@ impl Workspace {
             .flex_col()
             .gap_3()
             .children(transcript.iter().map(|entry| {
+                if let TranscriptEntry::ToolCall {
+                    name, arguments, ..
+                } = entry
+                {
+                    if name == "todo_write" {
+                        return Self::render_todo_call(arguments, &theme);
+                    }
+                }
                 let (role, text, color) = match entry {
                     TranscriptEntry::User { content, .. } => ("You", content, theme.text),
                     TranscriptEntry::Assistant { content, .. } => {
@@ -2165,6 +2422,7 @@ impl Workspace {
                             .text_color(color)
                             .child(text.clone()),
                     )
+                    .into_any_element()
             }));
 
         edge_faded(Theme::TRANSCRIPT_FADE_BAND, true, true, list)
@@ -3576,6 +3834,7 @@ impl Render for Workspace {
                             .as_ref()
                             .map(|_| self.render_approval(cx)),
                     )
+                    .children(self.render_todo_panel(cx))
                     .child(
                         div()
                             .px_6()
@@ -3643,6 +3902,7 @@ impl Render for Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::events::{TodoItem, TodoStatus};
     use harness_core::harness::HarnessSetupsConfig;
     use harness_core::spaces::SpacesConfig;
     use harness_core::tools::ToolInvocation;
@@ -3675,6 +3935,51 @@ mod tests {
             Workspace::build_tools(home.path(), root.path(), setups.get("standard").unwrap());
 
         assert!(tools.specs().iter().any(|spec| spec.name == "todo_write"));
+    }
+
+    #[test]
+    fn todo_call_summary_matches_comet_transcript_chips() {
+        let arguments = serde_json::json!({
+            "todos": [
+                {"content": "port domain", "status": "completed"},
+                {"content": "port panel", "status": "in_progress"},
+                {"content": "verify", "status": "pending"}
+            ]
+        });
+
+        assert_eq!(
+            Workspace::todo_call_summary(&arguments),
+            Some("1/3 done".to_string())
+        );
+        assert_eq!(Workspace::todo_call_summary(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn todo_panel_progress_follows_dsh_status_order() {
+        let todos = vec![
+            TodoItem {
+                content: "done".into(),
+                status: TodoStatus::Completed,
+            },
+            TodoItem {
+                content: "active".into(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                content: "pending".into(),
+                status: TodoStatus::Pending,
+            },
+            TodoItem {
+                content: "active two".into(),
+                status: TodoStatus::InProgress,
+            },
+        ];
+
+        assert_eq!(
+            Workspace::todo_panel_progress(&todos),
+            "1 completed\u{2002}·\u{2002}2 in progress\u{2002}·\u{2002}1 pending".to_string()
+        );
+        assert_eq!(Workspace::todo_panel_progress(&[]), String::new());
     }
 
     #[test]
