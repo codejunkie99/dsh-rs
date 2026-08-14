@@ -118,7 +118,10 @@ impl AgentLoop {
             let history = Self::derive_model_history(&log.events());
             let request = LlmRequest {
                 messages: history,
-                tools: self.tools.specs(),
+                // The model sees the session's scope-resolved tool schemas, not
+                // the global-only list, so a scoped `skill`/tool follows the
+                // same exact-identity view as the pre-step visibility gate.
+                tools: self.tools.specs_for(log.skill_scope()),
                 model: self.default_model.clone(),
                 metadata: BTreeMap::new(),
             };
@@ -302,11 +305,17 @@ impl AgentLoop {
         let Some(skill_tool) = &self.skill_tool else {
             return Ok(());
         };
-        if !self.tools.specs().iter().any(|spec| spec.name == "skill") {
+        let scope = log.skill_scope();
+        // Exact-identity visibility, not a name-only registry scan: the catalog
+        // is published only when this session's scope resolves the `skill` tool
+        // (`packages/core/tools/src/index.ts:1204` `get(name, scope)`). A
+        // scoped-only `skill` on an unrelated preset, or a shadowed name, reads
+        // as absent here.
+        if self.tools.get("skill", scope.clone()).is_none() {
             return Ok(());
         }
 
-        let entries = skill_tool.catalog_entries().await?;
+        let entries = skill_tool.catalog_entries_for(scope.clone()).await?;
         let latest_published = log.events().iter().rev().find_map(|event| {
             if let EventKind::SkillCatalogPublished { entries, .. } = &event.kind {
                 Some(entries.clone())
@@ -335,7 +344,7 @@ impl AgentLoop {
         }
 
         for name in invoked_skill_names(input) {
-            if let Some(content) = skill_tool.invoke_user(&name).await? {
+            if let Some(content) = skill_tool.invoke_user_for(&name, scope.clone()).await? {
                 log.append(EventKind::SkillInvocationInjected { name, content })?;
             }
         }

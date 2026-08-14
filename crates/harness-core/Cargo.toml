@@ -16,8 +16,10 @@ async-trait.workspace = true
 tokio.workspace = true
 futures.workspace = true
 parking_lot = "0.12"
+indexmap = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+async-trait.workspace = true

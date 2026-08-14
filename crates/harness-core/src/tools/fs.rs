@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use crate::tools::{Tool, ToolInvocation, ToolOutput, ToolSpec};
+use crate::tools::{Tool, ToolCallKind, ToolCallView, ToolInvocation, ToolOutput, ToolSpec};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -264,6 +264,163 @@ impl Tool for WriteFileTool {
             ok: true,
             output: format!("Wrote {path} ({} bytes).", content.len()),
         })
+    }
+}
+
+/// The model-facing `edit` tool: a literal-text replacement that is unique-match
+/// by default. Mirrors upstream `packages/fs/tool-fs/src/edit.ts` plus the
+/// literal-edit core in `packages/fs/fs-local/src/fsio.ts` (`applyLiteralEdit`).
+pub struct EditFileTool {
+    fs: Arc<ScopedFs>,
+}
+
+impl EditFileTool {
+    pub fn new(fs: Arc<ScopedFs>) -> Self {
+        Self { fs }
+    }
+
+    /// Collapse `\r\n` to `\n`, the canonical in-memory form upstream uses for
+    /// every edit basis; lone `\r` bytes are left untouched.
+    fn normalize_line_endings(text: &str) -> String {
+        text.replace("\r\n", "\n")
+    }
+
+    /// Detects the dominant line-ending style, mirroring upstream
+    /// `detectLineEndings` (CRLF wins on a tie only when it outnumbers bare LF).
+    fn detect_crlf(raw: &str) -> bool {
+        let crlf = raw.matches("\r\n").count();
+        let lf = raw.matches('\n').count().saturating_sub(crlf);
+        crlf > lf
+    }
+
+    /// Restores the file's original line-ending style after editing, mirroring
+    /// upstream `restoreLineEndings` (re-normalizes first so CRLF is never doubled).
+    fn restore_line_endings(text: &str, crlf: bool) -> String {
+        if crlf {
+            Self::normalize_line_endings(text).replace('\n', "\r\n")
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        if needle.is_empty() {
+            return 0;
+        }
+        haystack.match_indices(needle).count()
+    }
+
+    /// Apply the literal edit and return the line-ending-restored result. Errors
+    /// use the same model-facing messages as upstream `applyLiteralEdit`.
+    fn edit_text(
+        &self,
+        file_path: &str,
+        old_string: &str,
+        new_string: &str,
+        replace_all: bool,
+    ) -> Result<String> {
+        let raw = self.fs.read_text(file_path)?;
+        let content = Self::normalize_line_endings(&raw);
+        let old_norm = Self::normalize_line_endings(old_string);
+        if old_norm.is_empty() {
+            bail!("old_string must be a non-empty string");
+        }
+        let new_norm = Self::normalize_line_endings(new_string);
+        let replacements = Self::count_occurrences(&content, &old_norm);
+        if replacements == 0 {
+            bail!("old_string was not found in \"{file_path}\"");
+        }
+        if !replace_all && replacements > 1 {
+            bail!(
+                "old_string matched {replacements} times in \"{file_path}\"; provide a more specific old_string or set replace_all to true"
+            );
+        }
+        let edited = content.replace(&old_norm, &new_norm);
+        Ok(Self::restore_line_endings(&edited, Self::detect_crlf(&raw)))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditToolArguments {
+    file_path: String,
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    replace_all: bool,
+}
+
+#[async_trait]
+impl Tool for EditFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "edit".into(),
+            description: "Edit an existing UTF-8 text file by replacing literal text.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to edit, resolved by the filesystem backend."
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Literal text to replace. Must match exactly."
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Literal replacement text. Use an empty string to delete the match."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace all matches. Defaults to false; when false, old_string must appear exactly once."
+                    }
+                },
+                "required": ["file_path", "old_string", "new_string"]
+            }),
+        }
+    }
+
+    fn present_call(&self, arguments: &serde_json::Value) -> Option<ToolCallView> {
+        let file_path = arguments
+            .get("file_path")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        Some(ToolCallView::Generic {
+            title: format!("Edit {file_path}"),
+            kind: Some(ToolCallKind::Edit),
+            raw_input: None,
+        })
+    }
+
+    async fn execute(&self, invocation: ToolInvocation) -> Result<ToolOutput> {
+        let arguments: EditToolArguments = serde_json::from_value(invocation.arguments)?;
+        let file_path = arguments.file_path;
+        if file_path.trim().is_empty() {
+            bail!("file_path must be a non-empty string");
+        }
+        if arguments.old_string.is_empty() {
+            bail!("old_string must be a non-empty string");
+        }
+        if arguments.old_string == arguments.new_string {
+            bail!("old_string and new_string must differ");
+        }
+
+        let edited = self.edit_text(
+            &file_path,
+            &arguments.old_string,
+            &arguments.new_string,
+            arguments.replace_all,
+        )?;
+        self.fs.write_text(&file_path, &edited)?;
+
+        let output = if arguments.replace_all {
+            format!("The file {file_path} has been updated. All occurrences were successfully replaced.")
+        } else {
+            format!("The file {file_path} has been updated successfully.")
+        };
+        Ok(ToolOutput { ok: true, output })
     }
 }
 
