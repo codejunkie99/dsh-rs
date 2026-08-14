@@ -3,6 +3,7 @@ pub mod approval;
 pub mod cancellation;
 pub mod events;
 pub mod llm;
+pub mod prompt;
 pub mod remote;
 pub mod session;
 pub mod store;

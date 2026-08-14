@@ -13,6 +13,9 @@ pub enum EventKind {
     SessionTitleChanged {
         title: String,
     },
+    SystemPromptSnapshot {
+        content: Option<String>,
+    },
     TurnStarted,
     StepStarted {
         index: u64,

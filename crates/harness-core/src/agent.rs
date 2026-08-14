@@ -14,6 +14,7 @@ pub struct AgentLoop {
     tools: Arc<ToolRegistry>,
     approver: Arc<dyn ToolApprover>,
     default_model: Option<String>,
+    system_prompt: Option<String>,
     max_steps: u64,
 }
 
@@ -30,12 +31,18 @@ impl AgentLoop {
             tools,
             approver: Arc::new(PolicyApprover::new(ApprovalPolicy::default())),
             default_model: None,
+            system_prompt: None,
             max_steps: 24,
         }
     }
 
     pub fn with_default_model(mut self, model: Option<String>) -> Self {
         self.default_model = model;
+        self
+    }
+
+    pub fn with_system_prompt(mut self, prompt: Option<String>) -> Self {
+        self.system_prompt = prompt;
         self
     }
 
@@ -66,6 +73,11 @@ impl AgentLoop {
         input: String,
         cancellation: TurnCancellation,
     ) -> anyhow::Result<TurnOutcome> {
+        if log.view().system_prompt != self.system_prompt {
+            log.append(EventKind::SystemPromptSnapshot {
+                content: self.system_prompt.clone(),
+            })?;
+        }
         log.append(EventKind::TurnStarted)?;
         log.append(EventKind::UserMessage {
             id: Uuid::new_v4(),
@@ -294,6 +306,20 @@ impl AgentLoop {
 
     fn derive_model_history(events: &[crate::events::SessionEvent]) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
+        if let Some(content) = events
+            .iter()
+            .rev()
+            .find_map(|event| {
+                if let EventKind::SystemPromptSnapshot { content } = &event.kind {
+                    Some(content.clone())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+        {
+            messages.push(ChatMessage::System { content });
+        }
         for event in events {
             match &event.kind {
                 EventKind::UserMessage { content, .. } => messages.push(ChatMessage::User {
@@ -478,5 +504,106 @@ mod tests {
             EventKind::ToolResult { call_id, ok, output }
                 if call_id == "call_approval" && !ok && output.contains("requires explicit approval")
         )));
+    }
+
+    #[test]
+    fn model_history_uses_the_latest_durable_system_prompt_snapshot() {
+        let log = SessionLog::in_memory(Uuid::new_v4());
+        log.append(EventKind::SystemPromptSnapshot {
+            content: Some("old prompt".into()),
+        })
+        .unwrap();
+        log.append(EventKind::UserMessage {
+            id: Uuid::new_v4(),
+            content: "first".into(),
+        })
+        .unwrap();
+        log.append(EventKind::SystemPromptSnapshot {
+            content: Some("new prompt".into()),
+        })
+        .unwrap();
+        log.append(EventKind::UserMessage {
+            id: Uuid::new_v4(),
+            content: "second".into(),
+        })
+        .unwrap();
+
+        let history = AgentLoop::derive_model_history(&log.events());
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history[0],
+            ChatMessage::System {
+                content: "new prompt".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn turns_snapshot_changed_system_prompts_and_send_one_leading_message() {
+        struct RecordingAdapter {
+            requests: std::sync::Mutex<Vec<LlmRequest>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmAdapter for RecordingAdapter {
+            async fn stream(
+                &self,
+                request: LlmRequest,
+            ) -> anyhow::Result<tokio::sync::mpsc::Receiver<StreamFrame>> {
+                self.requests.lock().unwrap().push(request);
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                let message_id = Uuid::new_v4();
+                std::thread::spawn(move || {
+                    let _ = tx.blocking_send(StreamFrame::Delta {
+                        message_id,
+                        text: "ok".into(),
+                    });
+                    let _ = tx.blocking_send(StreamFrame::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    });
+                });
+                Ok(rx)
+            }
+        }
+
+        let adapter = Arc::new(RecordingAdapter {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let log = Arc::new(SessionLog::in_memory(Uuid::new_v4()));
+        let agent = AgentLoop::new(adapter.clone(), Arc::new(ToolRegistry::new()))
+            .with_system_prompt(Some("first prompt".into()));
+        agent.run_turn(log.clone(), "one".into()).await.unwrap();
+
+        let agent = AgentLoop::new(adapter.clone(), Arc::new(ToolRegistry::new()))
+            .with_system_prompt(Some("second prompt".into()));
+        agent.run_turn(log.clone(), "two".into()).await.unwrap();
+
+        let requests = adapter.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        for (index, prompt) in ["first prompt", "second prompt"].iter().enumerate() {
+            assert_eq!(
+                requests[index].messages[0],
+                ChatMessage::System {
+                    content: (*prompt).into(),
+                }
+            );
+            assert_eq!(
+                requests[index]
+                    .messages
+                    .iter()
+                    .filter(|message| matches!(message, ChatMessage::System { .. }))
+                    .count(),
+                1
+            );
+        }
+
+        let prompt_events = log
+            .events()
+            .iter()
+            .filter(|event| matches!(&event.kind, EventKind::SystemPromptSnapshot { .. }))
+            .count();
+        assert_eq!(prompt_events, 2);
+        assert_eq!(log.view().system_prompt.as_deref(), Some("second prompt"));
     }
 }
