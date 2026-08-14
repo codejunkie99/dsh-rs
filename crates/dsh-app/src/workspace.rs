@@ -37,6 +37,7 @@ use harness_core::tools::{EchoTool, ToolRegistry};
 use zeroize::Zeroize;
 
 const TITLEBAR_CLUSTER_BUTTONS_WIDTH: f32 = 24.0 * 3.0 + 2.0 * 2.0;
+const SIDEBAR_GLASS_FADE_BAND: f32 = 32.0;
 
 pub fn titlebar_cluster_start(fullscreen: bool) -> f32 {
     if fullscreen {
@@ -96,6 +97,16 @@ actions!(
 enum Route {
     Chat,
     Settings(SettingsSection),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarSessionRow {
+    id: uuid::Uuid,
+    title: String,
+    space_name: String,
+    harness_name: String,
+    time_ago: String,
+    working: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +180,56 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    fn sidebar_session_rows(
+        summaries: &[SessionSummary],
+        spaces: &SpacesConfig,
+        setups: &HarnessSetupsConfig,
+        selected_space: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<SidebarSessionRow> {
+        summaries
+            .iter()
+            .filter(|summary| match selected_space {
+                Some(space_id) => summary.space_id.as_deref() == Some(space_id),
+                None => true,
+            })
+            .map(|summary| SidebarSessionRow {
+                id: summary.id,
+                title: summary.title.clone(),
+                space_name: summary
+                    .space_id
+                    .as_deref()
+                    .and_then(|space_id| spaces.get(space_id))
+                    .map(|space| space.name().to_string())
+                    .unwrap_or_else(|| "Local harness".to_string()),
+                harness_name: summary
+                    .harness_id
+                    .as_deref()
+                    .and_then(|harness_id| setups.get(harness_id))
+                    .map(|setup| setup.name().to_string())
+                    .unwrap_or_else(|| "Standard".to_string()),
+                time_ago: Self::relative_time(summary.updated_at, now),
+                working: summary.turn_active,
+            })
+            .collect()
+    }
+
+    fn relative_time(
+        timestamp: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> String {
+        let seconds = (now - timestamp).num_seconds().max(0);
+        if seconds < 60 {
+            "now".to_string()
+        } else if seconds < 3_600 {
+            format!("{}m", seconds / 60)
+        } else if seconds < 86_400 {
+            format!("{}h", seconds / 3_600)
+        } else {
+            format!("{}d", seconds / 86_400)
+        }
+    }
+
     pub fn new(cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| ChatInput::new(InputKind::Chat, cx));
         let search_input = cx.new(|cx| ChatInput::new(InputKind::Search, cx));
@@ -1299,7 +1360,300 @@ impl Workspace {
         cx.notify();
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let visible_summaries: Vec<SessionSummary> = match &self.search_matches {
+            Some(matches) => self
+                .summaries
+                .iter()
+                .filter(|summary| matches.contains(&summary.id))
+                .cloned()
+                .collect(),
+            None => self.summaries.clone(),
+        };
+        let rows = Self::sidebar_session_rows(
+            &visible_summaries,
+            &self.spaces_config,
+            &self.harness_setups,
+            Some(&self.selected_space_id),
+            chrono::Utc::now(),
+        );
+        let selected_space = self
+            .spaces_config
+            .get(&self.selected_space_id)
+            .map(|space| space.name().to_string())
+            .unwrap_or_else(|| "All projects".to_string());
+
+        let session_rows = rows.into_iter().map(|row| {
+            let selected = self.selected.as_ref().is_some_and(|log| log.id() == row.id);
+            let fade_key = format!("sidebar-session-{}", row.id);
+            let status = if row.working {
+                theme.busy.opacity(0.55)
+            } else {
+                theme.text_muted.opacity(0.5)
+            };
+            let corner = if row.working {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(div().size(px(6.0)).rounded_full().bg(status))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(status)
+                            .child("Working"),
+                    )
+            } else {
+                div()
+                    .text_size(px(10.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(status)
+                    .child(row.time_ago.clone())
+            };
+            let select_id = row.id;
+            let rest_bg = if selected {
+                theme::glass_selected_bg()
+            } else {
+                theme.wash(0.0)
+            };
+            let hover_bg = if selected {
+                theme::glass_selected_bg()
+            } else {
+                theme.glass_hover()
+            };
+
+            div()
+                .id(SharedString::from(format!("session-{}", row.id)))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .rounded(px(8.0))
+                .px(px(Theme::SPACE_SM))
+                .py(px(6.0))
+                .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
+                .on_hover(motion::hover_listener(fade_key))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |workspace, _, _, cx| workspace.select(select_id, cx)),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(Theme::SPACE_SM))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(11.0))
+                                .line_height(px(14.0))
+                                .text_color(theme.text_muted.opacity(0.5))
+                                .child(row.space_name.clone()),
+                        )
+                        .child(corner),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .text_size(px(13.0))
+                        .line_height(px(17.0))
+                        .text_color(theme.text)
+                        .child(row.title.clone()),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .text_size(px(11.0))
+                        .line_height(px(14.0))
+                        .text_color(theme.text_muted.opacity(0.5))
+                        .child(row.harness_name.clone()),
+                )
+                .into_any_element()
+        });
+
+        let list = div().relative().flex_1().min_h_0().child(
+            div()
+                .id("sidebar-lists")
+                .size_full()
+                .overflow_y_scroll()
+                .px(px(Theme::SPACE_SM))
+                .flex()
+                .flex_col()
+                .pt(px(4.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .pb(px(Theme::SPACE_SM))
+                        .children(session_rows),
+                ),
+        );
+
+        div()
+            .id("sessions-sidebar")
+            .w(px(SIDEBAR_DEFAULT))
+            .h_full()
+            .flex()
+            .flex_col()
+            .pt(px(Theme::TITLEBAR_HEIGHT))
+            .bg(theme.wash(0.05))
+            .border_r_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .px(px(Theme::SPACE_SM))
+                    .pt(px(8.0))
+                    .pb(px(4.0))
+                    .child(
+                        div()
+                            .id("spaces-filter")
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(29.0))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(Theme::SPACE_SM))
+                            .rounded(px(8.0))
+                            .px(px(Theme::SPACE_SM))
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(motion::hover_blend(
+                                "spaces-filter",
+                                theme.text.opacity(0.8),
+                                theme.text,
+                            ))
+                            .bg(motion::hover_blend(
+                                "spaces-filter",
+                                theme.glass_hover().opacity(0.0),
+                                theme.glass_hover(),
+                            ))
+                            .on_hover(motion::hover_listener("spaces-filter"))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, window, cx| {
+                                    workspace.next_space(&NextSpace, window, cx)
+                                }),
+                            )
+                            .child(
+                                icon(icons::FOLDER)
+                                    .size(px(16.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(div().flex_1().min_w_0().truncate().child(selected_space))
+                            .child(
+                                icon(icons::ALT_ARROW_DOWN)
+                                    .size(px(14.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted.opacity(0.6)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("sidebar-new-session")
+                            .size(px(24.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .bg(motion::hover_blend(
+                                "sidebar-new-session",
+                                theme.wash(0.0),
+                                theme.wash(0.14),
+                            ))
+                            .on_hover(motion::hover_listener("sidebar-new-session"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, _, cx| workspace.create_session(cx)),
+                            )
+                            .child(
+                                icon(icons::PLUS)
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted.opacity(0.7)),
+                            ),
+                    ),
+            )
+            .when(self.search_matches.is_some(), |element| {
+                element.child(
+                    div()
+                        .flex_none()
+                        .px(px(Theme::SPACE_SM))
+                        .pb(px(4.0))
+                        .child(self.search_input.clone()),
+                )
+            })
+            .child(edge_faded(SIDEBAR_GLASS_FADE_BAND, true, true, list))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(Theme::SPACE_SM))
+                    .py(px(10.0))
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .size(px(24.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(theme.wash(0.08))
+                            .child(
+                                icon(icons::DEEPSEEK_MARK)
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text)
+                                    .child("Local device"),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .child(self.credential_label()),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    #[allow(dead_code)]
+    fn render_legacy_sidebar(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let theme = Theme::of(cx).clone();
         let visible_summaries: Vec<SessionSummary> = match &self.search_matches {
             Some(matches) => self
@@ -3325,5 +3679,50 @@ mod tests {
         let handler: fn(&mut Workspace, &FocusTerminal, &mut Window, &mut Context<Workspace>) =
             Workspace::focus_terminal;
         assert!(format!("{handler:p}") != "0");
+    }
+
+    #[test]
+    fn sidebar_rows_filter_spaces_and_resolve_display_names() {
+        use chrono::TimeZone;
+
+        let local = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let spaces = SpacesConfig::parse(&format!(
+            r#"{{
+                "spaces": [
+                    {{"id":"local","name":"Local harness","root":{:?}}},
+                    {{"id":"project","name":"Project","root":{:?}}}
+                ]
+            }}"#,
+            local.path(),
+            project.path()
+        ))
+        .unwrap();
+        let setups = HarnessSetupsConfig::default();
+        let now = chrono::Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0).unwrap();
+        let summary = |space_id: Option<&str>, minutes_ago: i64, working: bool| SessionSummary {
+            id: uuid::Uuid::new_v4(),
+            title: format!("{space_id:?} session"),
+            model: Some("deepseek-chat".into()),
+            space_id: space_id.map(str::to_string),
+            harness_id: Some("standard".into()),
+            event_count: 3,
+            turn_active: working,
+            updated_at: now - chrono::Duration::minutes(minutes_ago),
+        };
+        let summaries = vec![
+            summary(Some("local"), 61, false),
+            summary(Some("project"), 2, true),
+            summary(None, 1, false),
+        ];
+
+        let rows =
+            Workspace::sidebar_session_rows(&summaries, &spaces, &setups, Some("project"), now);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].space_name, "Project");
+        assert_eq!(rows[0].harness_name, "Standard");
+        assert_eq!(rows[0].time_ago, "2m");
+        assert!(rows[0].working);
     }
 }
