@@ -22,8 +22,8 @@ Rust mapping when one exists.
 | Upstream tool | Upstream path | Status | Rust mapping |
 |---|---|---|---|
 | `edit` (literal, unique-match, `replace_all`) | `tool-fs/src/edit.ts`, `fs-local/src/fsio.ts:applyLiteralEdit` | implemented | `tools::fs::EditFileTool` |
-| `write` (`file_path`, `content`, sandbox fields) | `tool-fs/src/write.ts` | partial | `tools::fs::WriteFileTool` (`write_file`: name mismatch, different result envelope) |
-| `read` (`file_path`, `offset`, `limit`, line-numbered window) | `tool-fs/src/read.ts` | partial | `tools::fs::ReadFileTool` (`read_file`: name mismatch, no windowing/line numbering) |
+| `write` (`file_path`, `content`, sandbox fields) | `tool-fs/src/write.ts` | partial | `tools::fs::WriteFileTool` (`write`: canonical name/schema; sandbox escalation and structured diff metadata remain) |
+| `read` (`file_path`, `offset`, `limit`, line-numbered window) | `tool-fs/src/read.ts`, `tool-fs/src/read-render.ts` | partial | `tools::fs::ReadFileTool` (`read`: canonical schema, 1-based windows, line numbers, 2,000-line/2,000-char/50 KiB caps; streaming and structured result metadata remain) |
 | `read_image` (conditional on attachments) | `tool-fs/src/read-image.ts` | missing | none |
 | `glob` (`tool-fs-search/src/glob.ts`) | `tool-fs-search/src/glob.ts` | missing | none |
 | `grep` (`tool-fs-search/src/grep.ts`) | `tool-fs-search/src/grep.ts` | missing | none |
@@ -53,6 +53,17 @@ with line-ending restoration, and the exact `The file ... has been updated
 successfully.` / `All occurrences were successfully replaced.` result strings.
 Regression: `crates/harness-core/tests/tool_edit.rs`.
 
-Remaining highest-confidence gaps, in order: `write`/`read` name + contract
-alignment, `read` windowing/line numbering, `glob`/`grep`, then `bash`
-shell semantics and the missing result-view presentation surface.
+Remaining highest-confidence gaps, in order: write/read sandbox escalation, structured diff/read result metadata, `glob`/`grep`, then `bash` shell semantics and the missing result-view presentation surface.
+
+
+## Write/read parity slice
+
+Compared with upstream `packages/fs/tool-fs/src/read.ts`, `read-render.ts`, and `write.ts`:
+
+- Canonical model-facing names are now `read` and `write`; the previous `read_file` and `write_file` names are no longer advertised.
+- `read` accepts required `file_path`, optional 1-based `offset` (default 1), and optional positive `limit` (default/max 2,000).
+- `read` returns the upstream envelope shape with `N: line` numbering, continuation/end-of-file footers, CRLF normalization, 2,000-character line truncation, and a 50 KiB selected-output cap.
+- `write` accepts `file_path` and `content`, performs the existing atomic scoped write, and returns the upstream `<path>/<type>/<content>` confirmation envelope with Created/Updated wording.
+- Registry and app assembly use the canonical names; regressions cover schemas, catalog membership, dispatch, bounded windows, invalid windows, and out-of-range offsets in `crates/harness-core/tests/tool_fs.rs` and `crates/harness-core/src/tools/fs.rs`.
+
+Remaining in this area: sandbox escalation fields/policy, structured before/after and read metadata for UI/replay, streaming large reads, `read_image`, search tools, and terminal/result presentation parity.
