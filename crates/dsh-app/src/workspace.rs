@@ -40,6 +40,7 @@ use harness_core::skills::{
 use harness_core::spaces::SpacesConfig;
 use harness_core::store::{SessionStore, SessionSummary};
 use harness_core::tools::fs::{EditFileTool, ListDirTool, ReadFileTool, ScopedFs, WriteFileTool};
+use harness_core::tools::search::{GlobTool, GrepTool};
 use harness_core::tools::shell::{CommandTool, ShellPolicy};
 use harness_core::tools::{EchoTool, SkillTool, TodoTool, ToolRegistry};
 use zeroize::Zeroize;
@@ -795,7 +796,7 @@ impl Workspace {
             skill_tool = Some(tool);
         }
 
-        let needs_filesystem = ["read", "list_dir", "write", "edit", "run_command"]
+        let needs_filesystem = ["read", "list_dir", "write", "edit", "glob", "grep", "run_command"]
             .iter()
             .any(|tool| harness.enables(tool));
         if needs_filesystem {
@@ -814,6 +815,12 @@ impl Workspace {
             }
             if harness.enables("edit") {
                 tools.register(Arc::new(EditFileTool::new(filesystem.clone())));
+            }
+            if harness.enables("glob") {
+                tools.register(Arc::new(GlobTool::new(filesystem.clone())));
+            }
+            if harness.enables("grep") {
+                tools.register(Arc::new(GrepTool::new(filesystem.clone())));
             }
 
             let shell_path = home.join(".dsh-rs").join("shell.json");
