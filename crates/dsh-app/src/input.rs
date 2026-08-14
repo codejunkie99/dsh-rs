@@ -1,7 +1,8 @@
 use std::ops::Range;
 
+use crate::theme::Theme;
 use gpui::{
-    actions, div, fill, hsla, prelude::*, px, rgb, white, App, ClipboardItem, Context, CursorStyle,
+    actions, div, fill, hsla, prelude::*, px, white, App, ClipboardItem, Context, CursorStyle,
     Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
     GlobalElementId, IntoElement, LayoutId, MouseButton, Pixels, Point, ShapedLine, Style, TextRun,
     UTF16Selection, Window,
@@ -482,7 +483,7 @@ impl Element for ChatTextElement {
                 Point::new(bounds.left() + cursor_x, bounds.top()),
                 gpui::size(px(2.), bounds.bottom() - bounds.top()),
             ),
-            rgb(0x8ee7ff),
+            Theme::dark().accent,
         ));
         Some((line, cursor, None))
     }
@@ -522,6 +523,7 @@ impl Element for ChatTextElement {
 
 impl Render for ChatInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::dark();
         div()
             .key_context(self.kind.key_context())
             .track_focus(&self.focus_handle(cx))
@@ -544,9 +546,9 @@ impl Render for ChatInput {
             .px_3()
             .py_2()
             .rounded_md()
-            .bg(rgb(0x191d25))
+            .bg(theme.raised)
             .border_1()
-            .border_color(rgb(0x303743))
+            .border_color(theme.border)
             .text_size(px(14.))
             .text_color(white())
             .child(ChatTextElement { input: cx.entity() })
