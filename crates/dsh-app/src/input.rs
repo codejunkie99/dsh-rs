@@ -486,7 +486,7 @@ impl Element for ChatTextElement {
                 Point::new(bounds.left() + cursor_x, bounds.top()),
                 gpui::size(px(2.), bounds.bottom() - bounds.top()),
             ),
-            Theme::dark().accent,
+            Theme::of(cx).accent,
         ));
         Some((line, cursor, None))
     }
@@ -533,7 +533,7 @@ impl Element for ChatTextElement {
 
 impl Render for ChatInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::dark();
+        let theme = Theme::of(cx).clone();
         div()
             .key_context(self.kind.key_context())
             .track_focus(&self.focus_handle(cx))
@@ -556,7 +556,7 @@ impl Render for ChatInput {
             .px_3()
             .py_2()
             .rounded_md()
-            .bg(theme.raised)
+            .bg(theme.surface_raised)
             .border_1()
             .border_color(theme.border)
             .text_size(px(14.))

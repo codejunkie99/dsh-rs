@@ -3,17 +3,22 @@ use std::sync::Arc;
 use crate::changes::{
     ChangeStatus, DiffLineKind, FileDiff, WorkspaceChanges, WorkspaceChangesState,
 };
+use crate::edge_fade::edge_faded;
+use crate::frost;
 use crate::icons::{self, icon};
 use crate::input::{ChatInput, InputKind};
-use crate::settings::UiSettings;
-use crate::terminal::{parse_argv, run_command, TerminalEntry, TerminalHistory};
-use crate::theme::{
-    titlebar_spacer_width, Theme, CONTEXT_PANE_WIDTH, CONTROL_RADIUS, HEADER_HEIGHT, SIDEBAR_WIDTH,
-    SPACE_LG, STATUS_HEIGHT, TERMINAL_DOCK_HEIGHT, TITLEBAR_HEIGHT, TITLEBAR_TOP_PAD,
+use crate::motion;
+use crate::settings::appearance::AppearancePage;
+use crate::settings::providers::{ProvidersEvent, ProvidersPage};
+use crate::settings::{UiSettings, RIGHT_PANE_DEFAULT, SIDEBAR_DEFAULT, TERMINAL_DEFAULT_HEIGHT};
+use crate::terminal::{
+    parse_argv, run_command, terminal_panel_bg, TerminalEntry, TerminalHistory,
+    TERMINAL_TAB_BAR_HEIGHT, TERMINAL_TAB_WIDTH,
 };
+use crate::theme::{self, Theme};
 use gpui::{
-    actions, div, prelude::*, px, Context, Entity, FontWeight, MouseButton, SharedString, Window,
-    WindowControlArea,
+    actions, div, prelude::*, px, AnyElement, Context, Entity, FontWeight, MouseButton,
+    SharedString, Subscription, Window, WindowControlArea,
 };
 use harness_core::agent::AgentLoop;
 use harness_core::approval::{
@@ -30,6 +35,38 @@ use harness_core::tools::fs::{ListDirTool, ReadFileTool, ScopedFs, WriteFileTool
 use harness_core::tools::shell::{CommandTool, ShellPolicy};
 use harness_core::tools::{EchoTool, ToolRegistry};
 use zeroize::Zeroize;
+
+const TITLEBAR_CLUSTER_BUTTONS_WIDTH: f32 = 24.0 * 3.0 + 2.0 * 2.0;
+
+pub fn titlebar_cluster_start(fullscreen: bool) -> f32 {
+    if fullscreen {
+        12.0
+    } else {
+        88.0
+    }
+}
+
+pub fn titlebar_spacer_width(is_macos: bool, fullscreen: bool, container_pad: f32) -> f32 {
+    if !is_macos {
+        return 0.0;
+    }
+    (titlebar_cluster_start(fullscreen) - container_pad).max(0.0)
+}
+
+pub fn cluster_buttons_start(is_macos: bool, fullscreen: bool) -> f32 {
+    if is_macos {
+        titlebar_cluster_start(fullscreen)
+    } else {
+        10.0
+    }
+}
+
+#[allow(dead_code)]
+pub fn cluster_clearance(is_macos: bool, fullscreen: bool, container_pad: f32) -> f32 {
+    (cluster_buttons_start(is_macos, fullscreen) + TITLEBAR_CLUSTER_BUTTONS_WIDTH + Theme::SPACE_SM
+        - container_pad)
+        .max(0.0)
+}
 
 actions!(
     workspace,
@@ -49,9 +86,41 @@ actions!(
         RunTerminalCommand,
         ToggleTerminal,
         ClearTerminal,
-        FocusTerminal
+        FocusTerminal,
+        OpenSettings,
+        CloseSettings
     ]
 );
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Chat,
+    Settings(SettingsSection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsSection {
+    Providers,
+    Appearance,
+}
+
+impl SettingsSection {
+    const ALL: [Self; 2] = [Self::Providers, Self::Appearance];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Providers => "Providers",
+            Self::Appearance => "Appearance",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Providers => icons::DEEPSEEK_MARK,
+            Self::Appearance => icons::TUNING,
+        }
+    }
+}
 
 pub struct Workspace {
     store: Arc<SessionStore>,
@@ -92,6 +161,11 @@ pub struct Workspace {
     search_matches: Option<Vec<uuid::Uuid>>,
     terminal_history: TerminalHistory,
     terminal_running: bool,
+    route: Route,
+    appearance_page: Option<Entity<AppearancePage>>,
+    providers_page: Option<Entity<ProvidersPage>>,
+    #[allow(dead_code)]
+    providers_subscription: Option<Subscription>,
 }
 
 impl Workspace {
@@ -234,6 +308,25 @@ impl Workspace {
             .with_system_prompt(system_prompt.clone())
             .with_approver(approver.clone())
             .with_max_steps(selected_harness.max_steps().into());
+        let providers_page = cx.new(|_| {
+            ProvidersPage::new(
+                credential_input.clone(),
+                credential_environment_override,
+                credential_file_configured,
+                SharedString::from(selection.model.clone()),
+            )
+        });
+        let providers_subscription = cx.subscribe(
+            &providers_page,
+            |workspace: &mut Workspace, _, event: &ProvidersEvent, cx: &mut Context<Workspace>| {
+                match event {
+                    ProvidersEvent::SaveRequested(key) => {
+                        workspace.save_provider_credential(key.clone(), cx)
+                    }
+                    ProvidersEvent::RemoveRequested => workspace.remove_credential(cx),
+                }
+            },
+        );
 
         let mut workspace = Self {
             store,
@@ -274,6 +367,10 @@ impl Workspace {
             search_matches: None,
             terminal_history: TerminalHistory::new(20),
             terminal_running: false,
+            route: Route::Chat,
+            appearance_page: None,
+            providers_page: Some(providers_page),
+            providers_subscription: Some(providers_subscription),
         };
         let workspace_handle = cx.entity();
         cx.spawn(async move |_, cx| {
@@ -313,6 +410,23 @@ impl Workspace {
         if let Err(error) = self.ui_settings.save(&self.ui_settings_path) {
             self.status = SharedString::from(format!("Could not save sidebar state: {error}"));
         }
+        cx.notify();
+    }
+
+    fn open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_section(SettingsSection::Providers, cx);
+    }
+
+    fn open_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        if section == SettingsSection::Appearance && self.appearance_page.is_none() {
+            self.appearance_page = Some(cx.new(AppearancePage::new));
+        }
+        self.route = Route::Settings(section);
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, _: &CloseSettings, _: &mut Window, cx: &mut Context<Self>) {
+        self.route = Route::Chat;
         cx.notify();
     }
 
@@ -530,9 +644,27 @@ impl Workspace {
         }
     }
 
+    fn sync_provider_page(&mut self, status: Option<SharedString>, cx: &mut Context<Self>) {
+        let Some(page) = self.providers_page.clone() else {
+            return;
+        };
+        let environment_override = self.credential_environment_override;
+        let file_configured = self.credential_file_configured;
+        let model = SharedString::from(self.model.clone());
+        page.update(cx, |page, cx| {
+            page.set_state(environment_override, file_configured, model, status, cx);
+        });
+    }
+
     fn save_credential(&mut self, _: &SaveCredential, _: &mut Window, cx: &mut Context<Self>) {
+        let key = self.credential_input.read(cx).text();
+        self.save_provider_credential(key, cx);
+    }
+
+    fn save_provider_credential(&mut self, key: String, cx: &mut Context<Self>) {
         if self.busy {
             self.status = SharedString::from("Wait for the current turn to finish.");
+            self.sync_provider_page(Some(self.status.clone()), cx);
             cx.notify();
             return;
         }
@@ -540,15 +672,17 @@ impl Workspace {
             self.status = SharedString::from(
                 "DEEPSEEK_API_KEY is set by the launching environment; stored keys stay read-only.",
             );
+            self.sync_provider_page(Some(self.status.clone()), cx);
             cx.notify();
             return;
         }
 
-        let mut key = self.credential_input.read(cx).text();
+        let mut key = key;
         let save_result = CredentialStore::save(&key, &self.credential_path);
         key.zeroize();
         if let Err(error) = save_result {
             self.status = SharedString::from(format!("Could not save API key: {error}"));
+            self.sync_provider_page(Some(self.status.clone()), cx);
             cx.notify();
             return;
         }
@@ -571,12 +705,14 @@ impl Workspace {
                     SharedString::from(format!("API key saved, but model reload failed: {error}"));
             }
         }
+        self.sync_provider_page(Some(self.status.clone()), cx);
         cx.notify();
     }
 
     fn remove_credential(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             self.status = SharedString::from("Wait for the current turn to finish.");
+            self.sync_provider_page(Some(self.status.clone()), cx);
             cx.notify();
             return;
         }
@@ -609,6 +745,7 @@ impl Workspace {
                 self.status = SharedString::from(format!("Could not remove API key: {error}"));
             }
         }
+        self.sync_provider_page(Some(self.status.clone()), cx);
         cx.notify();
     }
 
@@ -1163,7 +1300,7 @@ impl Workspace {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let theme = Theme::dark();
+        let theme = Theme::of(cx).clone();
         let visible_summaries: Vec<SessionSummary> = match &self.search_matches {
             Some(matches) => self
                 .summaries
@@ -1176,12 +1313,12 @@ impl Workspace {
 
         div()
             .id("sessions-sidebar")
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(SIDEBAR_DEFAULT))
             .h_full()
             .flex()
             .flex_col()
-            .pt(px(TITLEBAR_HEIGHT))
-            .bg(theme.surface)
+            .pt(px(Theme::TITLEBAR_HEIGHT))
+            .bg(theme.wash(0.05))
             .border_r_1()
             .border_color(theme.border)
             .overflow_scroll()
@@ -1196,7 +1333,7 @@ impl Workspace {
                         div()
                             .text_size(px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.faint)
+                            .text_color(theme.text_faint)
                             .child("SPACES"),
                     )
                     .children(self.busy.then(|| {
@@ -1209,7 +1346,7 @@ impl Workspace {
                             .rounded_md()
                             .bg(theme.danger)
                             .text_size(px(13.))
-                            .text_color(theme.background)
+                            .text_color(theme.bg)
                             .hover(|style| style.cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -1227,7 +1364,7 @@ impl Workspace {
                             .rounded_sm()
                             .bg(theme.accent)
                             .text_size(px(12.))
-                            .text_color(theme.background)
+                            .text_color(theme.bg)
                             .hover(|style| style.bg(theme.success).cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -1253,11 +1390,11 @@ impl Workspace {
                             .border_l_2()
                             .border_color(if selected { theme.accent } else { theme.border })
                             .bg(if selected {
-                                theme.raised
+                                theme::glass_selected_bg()
                             } else {
-                                theme.surface
+                                theme.wash(0.0)
                             })
-                            .hover(|style| style.bg(theme.raised).cursor_pointer())
+                            .hover(|style| style.bg(theme.glass_hover()).cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |workspace, _, _, cx| {
@@ -1270,24 +1407,29 @@ impl Workspace {
                                     .text_color(theme.text)
                                     .child(space.name().to_string()),
                             )
-                            .child(div().text_size(px(11.)).text_color(theme.faint).child({
-                                let root = space.root().display().to_string();
-                                if root.chars().count() > 34 {
-                                    format!(
-                                        "{}...{}",
-                                        root.chars().take(18).collect::<String>(),
-                                        root.chars()
-                                            .rev()
-                                            .take(13)
-                                            .collect::<Vec<_>>()
-                                            .into_iter()
-                                            .rev()
-                                            .collect::<String>()
-                                    )
-                                } else {
-                                    root
-                                }
-                            }))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.text_faint)
+                                    .child({
+                                        let root = space.root().display().to_string();
+                                        if root.chars().count() > 34 {
+                                            format!(
+                                                "{}...{}",
+                                                root.chars().take(18).collect::<String>(),
+                                                root.chars()
+                                                    .rev()
+                                                    .take(13)
+                                                    .collect::<Vec<_>>()
+                                                    .into_iter()
+                                                    .rev()
+                                                    .collect::<String>()
+                                            )
+                                        } else {
+                                            root
+                                        }
+                                    }),
+                            )
                     }),
             )
             .child(
@@ -1295,7 +1437,7 @@ impl Workspace {
                     .pt_2()
                     .text_size(px(13.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.faint)
+                    .text_color(theme.text_faint)
                     .child("HARNESS SETUPS"),
             )
             .children(
@@ -1315,11 +1457,11 @@ impl Workspace {
                             .border_l_2()
                             .border_color(if selected { theme.accent } else { theme.border })
                             .bg(if selected {
-                                theme.raised
+                                theme::glass_selected_bg()
                             } else {
-                                theme.surface
+                                theme.wash(0.0)
                             })
-                            .hover(|style| style.bg(theme.raised).cursor_pointer())
+                            .hover(|style| style.bg(theme.glass_hover()).cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |workspace, _, _, cx| {
@@ -1332,16 +1474,13 @@ impl Workspace {
                                     .text_color(theme.text)
                                     .child(setup.name().to_string()),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(theme.faint)
-                                    .child(format!(
-                                        "{} tools · {} max steps",
-                                        setup.enabled_tools().len(),
-                                        setup.max_steps()
-                                    )),
-                            )
+                            .child(div().text_size(px(11.)).text_color(theme.text_faint).child(
+                                format!(
+                                    "{} tools · {} max steps",
+                                    setup.enabled_tools().len(),
+                                    setup.max_steps()
+                                ),
+                            ))
                     }),
             )
             .child(self.search_input.clone())
@@ -1356,7 +1495,7 @@ impl Workspace {
                             .flex_1()
                             .py_1()
                             .rounded_sm()
-                            .bg(theme.raised)
+                            .bg(theme.surface_raised)
                             .text_size(px(12.))
                             .text_color(theme.text)
                             .flex()
@@ -1375,7 +1514,7 @@ impl Workspace {
                             .flex_1()
                             .py_1()
                             .rounded_sm()
-                            .bg(theme.raised)
+                            .bg(theme.surface_raised)
                             .text_size(px(12.))
                             .text_color(theme.success)
                             .flex()
@@ -1399,7 +1538,7 @@ impl Workspace {
                         div()
                             .text_size(px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.faint)
+                            .text_color(theme.text_faint)
                             .child("MODEL ACCESS"),
                     )
                     .child(self.credential_input.clone())
@@ -1415,7 +1554,7 @@ impl Workspace {
                                     .rounded_sm()
                                     .bg(theme.success)
                                     .text_size(px(12.))
-                                    .text_color(theme.background)
+                                    .text_color(theme.bg)
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -1437,10 +1576,10 @@ impl Workspace {
                                     .bg(if self.credential_file_configured {
                                         theme.danger
                                     } else {
-                                        theme.raised
+                                        theme.surface_raised
                                     })
                                     .text_size(px(12.))
-                                    .text_color(theme.background)
+                                    .text_color(theme.bg)
                                     .flex()
                                     .items_center()
                                     .justify_center()
@@ -1462,7 +1601,7 @@ impl Workspace {
                             } else if self.credential_file_configured {
                                 theme.success
                             } else {
-                                theme.faint
+                                theme.text_faint
                             })
                             .child(self.credential_label()),
                     ),
@@ -1479,11 +1618,11 @@ impl Workspace {
                     .border_l_2()
                     .border_color(if selected { theme.accent } else { theme.border })
                     .bg(if selected {
-                        theme.raised
+                        theme::glass_selected_bg()
                     } else {
-                        theme.surface
+                        theme.wash(0.0)
                     })
-                    .hover(|style| style.bg(theme.raised).cursor_pointer())
+                    .hover(|style| style.bg(theme.glass_hover()).cursor_pointer())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |workspace, _, _, cx| workspace.select(id, cx)),
@@ -1497,7 +1636,7 @@ impl Workspace {
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(theme.faint)
+                            .text_color(theme.text_faint)
                             .child(format!(
                                 "{} · {} · {} · {} events{}",
                                 self.spaces_config
@@ -1520,15 +1659,15 @@ impl Workspace {
             }))
     }
 
-    fn render_transcript(&self) -> impl IntoElement {
-        let theme = Theme::dark();
+    fn render_transcript(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx).clone();
         let transcript = self
             .selected_view
             .as_ref()
             .map(|view| view.transcript.as_slice())
             .unwrap_or(&[]);
 
-        div()
+        let list = div()
             .id("transcript")
             .flex_1()
             .overflow_scroll()
@@ -1553,14 +1692,14 @@ impl Workspace {
                     .px_3()
                     .py_2()
                     .rounded_md()
-                    .bg(theme.raised)
+                    .bg(theme.surface_raised)
                     .border_1()
                     .border_color(theme.border)
                     .child(
                         div()
                             .text_size(px(11.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.faint)
+                            .text_color(theme.text_faint)
                             .child(role),
                     )
                     .child(
@@ -1569,76 +1708,145 @@ impl Workspace {
                             .text_color(color)
                             .child(text.clone()),
                     )
-            }))
+            }));
+
+        edge_faded(Theme::TRANSCRIPT_FADE_BAND, true, true, list)
+            .inset_top(Theme::TITLEBAR_HEIGHT)
+            .band_top(Theme::TRANSCRIPT_FADE_BAND)
+            .band_bottom(Theme::TRANSCRIPT_FADE_BAND)
     }
 
     fn render_terminal_dock(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let theme = Theme::dark();
+        let theme = Theme::of(cx).clone();
 
         div()
             .id("terminal-dock")
-            .h(px(TERMINAL_DOCK_HEIGHT))
+            .h(px(TERMINAL_DEFAULT_HEIGHT))
             .flex_none()
             .flex()
             .flex_col()
             .border_t_1()
             .border_color(theme.border)
-            .bg(theme.surface)
+            .bg(terminal_panel_bg(&theme))
             .child(
                 div()
-                    .h(px(32.0))
+                    .id("terminal-tab-bar")
+                    .h(px(TERMINAL_TAB_BAR_HEIGHT))
                     .flex_none()
                     .flex()
+                    .flex_row()
                     .items_center()
-                    .justify_between()
-                    .px_4()
+                    .gap(px(4.0))
+                    .pl(px(8.0))
+                    .pr(px(6.0))
                     .border_b_1()
-                    .border_color(theme.border)
+                    .border_color(theme::hairline(0.07))
                     .child(
                         div()
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.faint)
-                            .child("COMMAND DOCK"),
-                    )
-                    .child(
-                        div()
+                            .id("terminal-tab-1")
+                            .w(px(TERMINAL_TAB_WIDTH))
+                            .h(px(28.0))
+                            .flex_none()
                             .flex()
+                            .flex_row()
                             .items_center()
-                            .gap_2()
+                            .gap(px(6.0))
+                            .pl(px(8.0))
+                            .pr(px(4.0))
+                            .rounded(px(8.0))
+                            .bg(motion::hover_blend(
+                                "terminal-tab-1",
+                                theme::ink(0.08),
+                                theme.element_hover,
+                            ))
+                            .on_hover(motion::hover_listener("terminal-tab-1"))
+                            .text_size(px(12.0))
+                            .text_color(theme.text)
                             .child(
-                                div()
-                                    .id("clear-terminal")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .text_size(px(10.))
-                                    .text_color(theme.muted)
-                                    .hover(|style| style.bg(theme.raised).cursor_pointer())
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|workspace, _, window, cx| {
-                                            workspace.clear_terminal(&ClearTerminal, window, cx)
-                                        }),
-                                    )
-                                    .child("Clear"),
+                                icon(icons::TERMINAL)
+                                    .size(px(16.0))
+                                    .text_color(theme.text.opacity(0.8)),
                             )
+                            .child(div().flex_1().min_w_0().truncate().child("Terminal 1"))
                             .child(
                                 div()
-                                    .id("close-terminal")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .text_size(px(10.))
-                                    .text_color(theme.muted)
-                                    .hover(|style| style.bg(theme.raised).cursor_pointer())
+                                    .id("terminal-tab-close")
+                                    .size(px(20.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme::ink(0.09)))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|workspace, _, window, cx| {
                                             workspace.toggle_terminal(&ToggleTerminal, window, cx)
                                         }),
                                     )
-                                    .child("Close"),
+                                    .child(
+                                        icon(icons::CLOSE)
+                                            .size(px(12.0))
+                                            .text_color(theme.text_muted.opacity(0.8)),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("terminal-new-tab")
+                            .size(px(28.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(8.0))
+                            .cursor_pointer()
+                            .bg(motion::hover_blend(
+                                "terminal-new-tab",
+                                gpui::transparent_black(),
+                                theme::ink(0.05),
+                            ))
+                            .on_hover(motion::hover_listener("terminal-new-tab"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, window, cx| {
+                                    workspace.focus_terminal(&FocusTerminal, window, cx)
+                                }),
+                            )
+                            .child(
+                                icon(icons::PLUS)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted.opacity(0.6)),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("terminal-collapse")
+                            .size(px(28.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(8.0))
+                            .cursor_pointer()
+                            .bg(motion::hover_blend(
+                                "terminal-collapse",
+                                gpui::transparent_black(),
+                                theme::ink(0.05),
+                            ))
+                            .on_hover(motion::hover_listener("terminal-collapse"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, window, cx| {
+                                    workspace.toggle_terminal(&ToggleTerminal, window, cx)
+                                }),
+                            )
+                            .child(
+                                icon(icons::ALT_ARROW_DOWN)
+                                    .size(px(13.0))
+                                    .text_color(theme.text_muted.opacity(0.55)),
                             ),
                     ),
             )
@@ -1660,15 +1868,15 @@ impl Workspace {
                             .py_1()
                             .rounded_sm()
                             .bg(if self.terminal_running {
-                                theme.raised
+                                theme.surface_raised
                             } else {
                                 theme.accent
                             })
                             .text_size(px(11.))
                             .text_color(if self.terminal_running {
-                                theme.faint
+                                theme.text_faint
                             } else {
-                                theme.background
+                                theme.bg
                             })
                             .hover(|style| {
                                 if self.terminal_running {
@@ -1699,12 +1907,12 @@ impl Workspace {
                     .child(if self.terminal_running {
                         div()
                             .text_size(px(11.))
-                            .text_color(theme.faint)
+                            .text_color(theme.text_faint)
                             .child("Running")
                     } else {
                         div()
                             .text_size(px(11.))
-                            .text_color(theme.faint)
+                            .text_color(theme.text_faint)
                             .child("Direct allowlisted commands only")
                     })
                     .children(self.terminal_history.entries().iter().map(|entry| {
@@ -1736,7 +1944,11 @@ impl Workspace {
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(if entry.ok { theme.muted } else { theme.danger })
+                                    .text_color(if entry.ok {
+                                        theme.text_muted
+                                    } else {
+                                        theme.danger
+                                    })
                                     .child(output),
                             )
                     })),
@@ -1744,7 +1956,7 @@ impl Workspace {
     }
 
     fn render_changes_section(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let theme = Theme::dark();
+        let theme = Theme::of(cx).clone();
         let section = div()
             .flex()
             .flex_col()
@@ -1757,7 +1969,7 @@ impl Workspace {
                     div()
                         .text_size(px(11.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.faint)
+                        .text_color(theme.text_faint)
                         .child("CHANGES"),
                 ),
             );
@@ -1766,7 +1978,7 @@ impl Workspace {
             return section.child(
                 div()
                     .text_size(px(11.))
-                    .text_color(theme.faint)
+                    .text_color(theme.text_faint)
                     .child("Scanning repository"),
             );
         }
@@ -1775,7 +1987,7 @@ impl Workspace {
             WorkspaceChangesState::NotRepository => section.child(
                 div()
                     .text_size(px(11.))
-                    .text_color(theme.faint)
+                    .text_color(theme.text_faint)
                     .child("No repository"),
             ),
             WorkspaceChangesState::Failed(error) => {
@@ -1814,7 +2026,7 @@ impl Workspace {
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(theme.faint)
+                                    .text_color(theme.text_faint)
                                     .child(totals),
                             ),
                     )
@@ -1864,9 +2076,9 @@ impl Workspace {
                                     .gap_2()
                                     .rounded_sm()
                                     .bg(if selected {
-                                        theme.raised
+                                        theme.surface_raised
                                     } else {
-                                        theme.background
+                                        theme.bg
                                     })
                                     .cursor_pointer()
                                     .on_mouse_down(
@@ -1908,7 +2120,7 @@ impl Workspace {
                                                     .text_color(if file.staged {
                                                         theme.warning
                                                     } else {
-                                                        theme.faint
+                                                        theme.text_faint
                                                     })
                                                     .child(if file.staged {
                                                         "staged"
@@ -1919,7 +2131,7 @@ impl Workspace {
                                             .child(
                                                 div()
                                                     .text_size(px(10.))
-                                                    .text_color(theme.muted)
+                                                    .text_color(theme.text_muted)
                                                     .child(counts),
                                             ),
                                     )
@@ -1929,7 +2141,7 @@ impl Workspace {
                         element.child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(theme.faint)
+                                .text_color(theme.text_faint)
                                 .child(format!("+{hidden_count} more files")),
                         )
                     })
@@ -1938,7 +2150,7 @@ impl Workspace {
     }
 
     fn render_selected_diff_section(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let theme = Theme::dark();
+        let theme = Theme::of(cx).clone();
         let section = div()
             .flex()
             .flex_col()
@@ -1971,7 +2183,11 @@ impl Workspace {
                     .child(
                         div()
                             .text_size(px(10.))
-                            .text_color(if *staged { theme.warning } else { theme.faint })
+                            .text_color(if *staged {
+                                theme.warning
+                            } else {
+                                theme.text_faint
+                            })
                             .child(if *staged { "staged" } else { "worktree" }),
                     )
                     .child(
@@ -1981,8 +2197,8 @@ impl Workspace {
                             .py_1()
                             .rounded_sm()
                             .text_size(px(10.))
-                            .text_color(theme.muted)
-                            .hover(|style| style.bg(theme.raised).cursor_pointer())
+                            .text_color(theme.text_muted)
+                            .hover(|style| style.bg(theme.surface_raised).cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|workspace, _, _, cx| {
@@ -2002,7 +2218,7 @@ impl Workspace {
             return section.child(
                 div()
                     .text_size(px(11.))
-                    .text_color(theme.faint)
+                    .text_color(theme.text_faint)
                     .child("Loading diff"),
             );
         }
@@ -2021,9 +2237,9 @@ impl Workspace {
         section
             .children(diff.lines.iter().map(|line| {
                 let color = match line.kind {
-                    DiffLineKind::Meta => theme.faint,
+                    DiffLineKind::Meta => theme.text_faint,
                     DiffLineKind::Hunk => theme.accent,
-                    DiffLineKind::Context => theme.muted,
+                    DiffLineKind::Context => theme.text_muted,
                     DiffLineKind::Addition => theme.success,
                     DiffLineKind::Deletion => theme.danger,
                 };
@@ -2038,14 +2254,14 @@ impl Workspace {
                 element.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(theme.faint)
+                        .text_color(theme.text_faint)
                         .child("Diff truncated at 500 lines"),
                 )
             })
     }
 
     fn render_context_pane(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let theme = Theme::dark();
+        let theme = Theme::of(cx).clone();
         let view = self.selected_view.clone();
         let title = view
             .as_ref()
@@ -2104,18 +2320,18 @@ impl Workspace {
 
         div()
             .id("context-pane")
-            .w(px(CONTEXT_PANE_WIDTH))
+            .w(px(RIGHT_PANE_DEFAULT))
             .h_full()
             .flex()
             .flex_col()
             .flex_none()
-            .pt(px(TITLEBAR_HEIGHT))
-            .bg(theme.background)
+            .pt(px(Theme::TITLEBAR_HEIGHT))
+            .bg(theme.bg)
             .border_l_1()
             .border_color(theme.border)
             .child(
                 div()
-                    .h(px(HEADER_HEIGHT))
+                    .h(px(Theme::HEADER_HEIGHT))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -2136,8 +2352,8 @@ impl Workspace {
                             .py_1()
                             .rounded_sm()
                             .text_size(px(11.))
-                            .text_color(theme.muted)
-                            .hover(|style| style.bg(theme.raised).cursor_pointer())
+                            .text_color(theme.text_muted)
+                            .hover(|style| style.bg(theme.surface_raised).cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|workspace, _, _, cx| workspace.refresh_changes(cx)),
@@ -2151,8 +2367,8 @@ impl Workspace {
                             .py_1()
                             .rounded_sm()
                             .text_size(px(11.))
-                            .text_color(theme.muted)
-                            .hover(|style| style.bg(theme.raised).cursor_pointer())
+                            .text_color(theme.text_muted)
+                            .hover(|style| style.bg(theme.surface_raised).cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|workspace, _, window, cx| {
@@ -2192,13 +2408,13 @@ impl Workspace {
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(theme.faint)
+                                            .text_color(theme.text_faint)
                                             .child("Model"),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(theme.muted)
+                                            .text_color(theme.text_muted)
                                             .child(model),
                                     ),
                             )
@@ -2209,7 +2425,7 @@ impl Workspace {
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(theme.faint)
+                                            .text_color(theme.text_faint)
                                             .child("Setup"),
                                     )
                                     .child(
@@ -2220,13 +2436,13 @@ impl Workspace {
                                             .child(
                                                 div()
                                                     .text_size(px(11.))
-                                                    .text_color(theme.muted)
+                                                    .text_color(theme.text_muted)
                                                     .child(harness_name),
                                             )
                                             .child(
                                                 div()
                                                     .text_size(px(10.))
-                                                    .text_color(theme.faint)
+                                                    .text_color(theme.text_faint)
                                                     .child(harness_detail),
                                             ),
                                     ),
@@ -2238,13 +2454,13 @@ impl Workspace {
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(theme.faint)
+                                            .text_color(theme.text_faint)
                                             .child("Events"),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(theme.muted)
+                                            .text_color(theme.text_muted)
                                             .child(event_count.to_string()),
                                     ),
                             )
@@ -2255,7 +2471,7 @@ impl Workspace {
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(theme.faint)
+                                            .text_color(theme.text_faint)
                                             .child("Turn"),
                                     )
                                     .child(
@@ -2264,7 +2480,7 @@ impl Workspace {
                                             .text_color(if turn_state == "active" {
                                                 theme.accent
                                             } else {
-                                                theme.muted
+                                                theme.text_muted
                                             })
                                             .child(turn_state),
                                     ),
@@ -2276,13 +2492,13 @@ impl Workspace {
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(theme.faint)
+                                            .text_color(theme.text_faint)
                                             .child("Prompt"),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(theme.muted)
+                                            .text_color(theme.text_muted)
                                             .child(prompt),
                                     ),
                             ),
@@ -2291,7 +2507,7 @@ impl Workspace {
                         div()
                             .text_size(px(11.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.faint)
+                            .text_color(theme.text_faint)
                             .child("Recent tools"),
                     )
                     .child(
@@ -2322,7 +2538,7 @@ impl Workspace {
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(theme.muted)
+                                            .text_color(theme.text_muted)
                                             .child(value),
                                     )
                             }))
@@ -2330,7 +2546,7 @@ impl Workspace {
                                 el.child(
                                     div()
                                         .text_size(px(11.))
-                                        .text_color(theme.faint)
+                                        .text_color(theme.text_faint)
                                         .child("No tool activity"),
                                 )
                             }),
@@ -2339,7 +2555,7 @@ impl Workspace {
     }
 
     fn render_approval(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::dark();
+        let theme = Theme::of(cx).clone();
         let (tool_name, call_id, arguments) = self
             .pending_approval
             .as_ref()
@@ -2352,14 +2568,14 @@ impl Workspace {
             })
             .unwrap_or_default();
 
-        div()
+        let card = div()
             .id("approval")
             .mx_6()
             .my_3()
             .px_4()
             .py_3()
             .rounded_md()
-            .bg(theme.raised)
+            .bg(theme.surface_raised)
             .border_1()
             .border_color(theme.warning)
             .flex()
@@ -2379,7 +2595,7 @@ impl Workspace {
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(theme.muted)
+                            .text_color(theme.text_muted)
                             .child(format!("{call_id} {arguments}")),
                     ),
             )
@@ -2395,7 +2611,7 @@ impl Workspace {
                             .rounded_sm()
                             .bg(theme.success)
                             .text_size(px(12.))
-                            .text_color(theme.background)
+                            .text_color(theme.bg)
                             .hover(|style| style.bg(theme.success).cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -2413,7 +2629,7 @@ impl Workspace {
                             .rounded_sm()
                             .bg(theme.danger)
                             .text_size(px(12.))
-                            .text_color(theme.background)
+                            .text_color(theme.bg)
                             .hover(|style| style.cursor_pointer())
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -2423,22 +2639,194 @@ impl Workspace {
                             )
                             .child("Deny"),
                     ),
-            )
+            );
+
+        frost::frosted(Theme::PANEL_RADIUS, 24.0, card)
     }
 }
 
 impl Workspace {
+    fn render_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let section = match self.route {
+            Route::Settings(section) => section,
+            Route::Chat => SettingsSection::Providers,
+        };
+        let outlet = match section {
+            SettingsSection::Providers => self
+                .providers_page
+                .clone()
+                .map(|page| page.into_any_element())
+                .unwrap_or_else(|| div().into_any_element()),
+            SettingsSection::Appearance => self
+                .appearance_page
+                .clone()
+                .map(|page| page.into_any_element())
+                .unwrap_or_else(|| div().into_any_element()),
+        };
+
+        div()
+            .key_context("Workspace")
+            .id("settings-root")
+            .size_full()
+            .relative()
+            .font_family(theme.font_sans.clone())
+            .flex()
+            .bg(theme.glass())
+            .text_color(theme.text)
+            .on_action(cx.listener(|workspace, _: &CloseSettings, window, cx| {
+                workspace.close_settings(&CloseSettings, window, cx)
+            }))
+            .child(
+                div()
+                    .w(px(SIDEBAR_DEFAULT))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .pt(px(Theme::TITLEBAR_HEIGHT))
+                    .child(
+                        div()
+                            .flex_1()
+                            .px(px(Theme::SPACE_SM))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .px(px(Theme::SPACE_SM))
+                                    .pt(px(12.0))
+                                    .pb(px(4.0))
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .child("Settings"),
+                            )
+                            .child(div().flex().flex_col().gap(px(2.0)).children(
+                                SettingsSection::ALL.into_iter().map(|item| {
+                                    let selected = item == section;
+                                    div()
+                                                .id(SharedString::from(format!(
+                                                    "settings-nav-{}",
+                                                    item.label()
+                                                )))
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(8.0))
+                                                .rounded(px(8.0))
+                                                .px(px(Theme::SPACE_SM))
+                                                .py(px(6.0))
+                                                .text_size(px(13.0))
+                                                .when(selected, |element| {
+                                                    element
+                                                        .bg(theme::glass_selected_bg())
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                })
+                                                .text_color(if selected {
+                                                    theme.text
+                                                } else {
+                                                    theme.text_muted
+                                                })
+                                                .cursor_pointer()
+                                                .hover(|style| {
+                                                    style
+                                                        .bg(theme.glass_hover())
+                                                        .text_color(theme.text)
+                                                })
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        move |workspace,
+                                                         _: &gpui::MouseDownEvent,
+                                                         _,
+                                                         cx| {
+                                                            workspace.open_settings_section(
+                                                                item, cx,
+                                                            )
+                                                        },
+                                                    ),
+                                                )
+                                                .child(
+                                                    icon(item.icon())
+                                                        .size(px(16.0))
+                                                        .text_color(theme.text_muted),
+                                                )
+                                                .child(item.label())
+                                }),
+                            )),
+                    )
+                    .child(
+                        div().px(px(Theme::SPACE_SM)).pb(px(12.0)).child(
+                            div()
+                                .id("settings-back")
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .rounded(px(8.0))
+                                .px(px(Theme::SPACE_SM))
+                                .py(px(6.0))
+                                .text_size(px(13.0))
+                                .text_color(theme.text_muted)
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme.glass_hover()).text_color(theme.text))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(
+                                        |workspace, _: &gpui::MouseDownEvent, window, cx| {
+                                            workspace.close_settings(&CloseSettings, window, cx)
+                                        },
+                                    ),
+                                )
+                                .child(
+                                    icon(icons::ALT_ARROW_LEFT)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child("Back"),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .pt(px(Theme::TITLEBAR_HEIGHT))
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().min_h_0().child(outlet)),
+            )
+            .into_any_element()
+    }
+
     fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::dark();
-        let title = self
-            .selected_view
-            .as_ref()
-            .map(|view| view.title.clone())
-            .unwrap_or_default();
-        let target = SharedString::from(self.selected_harness().name().to_string());
-        let cluster_end = 88.0 + 76.0 + SPACE_LG;
+        let theme = Theme::of(cx).clone();
+        let settings_section = match self.route {
+            Route::Settings(section) => Some(section),
+            Route::Chat => None,
+        };
+        let settings = settings_section.is_some();
+        let title = if let Some(section) = settings_section {
+            SharedString::from(section.label())
+        } else {
+            SharedString::from(
+                self.selected_view
+                    .as_ref()
+                    .map(|view| view.title.clone())
+                    .unwrap_or_default(),
+            )
+        };
+        let harness_name = self.selected_harness().name().to_string();
+        let target = if settings {
+            SharedString::from("")
+        } else {
+            harness_name.into()
+        };
+        let cluster_end = cluster_buttons_start(cfg!(target_os = "macos"), false)
+            + TITLEBAR_CLUSTER_BUTTONS_WIDTH
+            + 10.0;
         let title_left = if self.ui_settings.sidebar_visible {
-            SIDEBAR_WIDTH + SPACE_LG
+            SIDEBAR_DEFAULT + Theme::SPACE_LG
         } else {
             cluster_end
         };
@@ -2450,13 +2838,13 @@ impl Workspace {
             .top_0()
             .left_0()
             .right_0()
-            .h(px(TITLEBAR_HEIGHT))
+            .h(px(Theme::TITLEBAR_HEIGHT))
             .flex()
             .flex_none()
             .items_center()
             .gap(px(2.0))
             .px(px(10.0))
-            .pt(px(TITLEBAR_TOP_PAD))
+            .pt(px(Theme::TITLEBAR_TOP_PAD))
             .window_control_area(WindowControlArea::Drag)
             .child(div().w(px(titlebar_spacer_width(
                 cfg!(target_os = "macos"),
@@ -2471,9 +2859,14 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(CONTROL_RADIUS))
+                    .rounded(px(Theme::CONTROL_RADIUS))
                     .occlude()
-                    .hover(|style| style.bg(theme.element_hover).cursor_pointer())
+                    .bg(motion::hover_blend(
+                        "titlebar-toggle-sidebar",
+                        theme.glass_hover().opacity(0.0),
+                        theme.glass_hover(),
+                    ))
+                    .on_hover(motion::hover_listener("titlebar-toggle-sidebar"))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|workspace, _, window, cx| {
@@ -2483,7 +2876,7 @@ impl Workspace {
                     .child(
                         icon(icons::SIDEBAR_MINIMALISTIC_LEFT)
                             .size(px(16.0))
-                            .text_color(theme.muted),
+                            .text_color(theme.text_muted),
                     ),
             )
             .child(
@@ -2497,7 +2890,7 @@ impl Workspace {
                     .child(
                         icon(icons::ARROW_LEFT)
                             .size(px(16.0))
-                            .text_color(theme.muted),
+                            .text_color(theme.text_muted),
                     ),
             )
             .child(
@@ -2511,10 +2904,10 @@ impl Workspace {
                     .child(
                         icon(icons::ARROW_RIGHT)
                             .size(px(16.0))
-                            .text_color(theme.muted),
+                            .text_color(theme.text_muted),
                     ),
             )
-            .child(div().w(px(SPACE_LG)).flex_none())
+            .child(div().w(px(Theme::SPACE_LG)).flex_none())
             .child(div().w(px(title_gutter)).flex_none())
             .child(
                 div()
@@ -2531,15 +2924,45 @@ impl Workspace {
                             .text_color(theme.text)
                             .child(title),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(12.0))
-                            .text_color(theme.muted)
-                            .child(target),
-                    ),
+                    .when(!settings, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(12.0))
+                                .text_color(theme.text_muted)
+                                .child(target.clone()),
+                        )
+                    }),
             )
             .child(div().flex_1())
+            .child(
+                div()
+                    .id("titlebar-open-settings")
+                    .size(px(24.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(Theme::CONTROL_RADIUS))
+                    .occlude()
+                    .bg(motion::hover_blend(
+                        "titlebar-open-settings",
+                        theme.glass_hover().opacity(0.0),
+                        theme.glass_hover(),
+                    ))
+                    .on_hover(motion::hover_listener("titlebar-open-settings"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|workspace, _, window, cx| {
+                            workspace.open_settings(&OpenSettings, window, cx)
+                        }),
+                    )
+                    .child(
+                        icon(icons::SETTINGS_MINIMALISTIC)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted),
+                    ),
+            )
             .child(
                 div()
                     .id("titlebar-toggle-context")
@@ -2548,9 +2971,14 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(CONTROL_RADIUS))
+                    .rounded(px(Theme::CONTROL_RADIUS))
                     .occlude()
-                    .hover(|style| style.bg(theme.element_hover).cursor_pointer())
+                    .bg(motion::hover_blend(
+                        "titlebar-toggle-context",
+                        theme.glass_hover().opacity(0.0),
+                        theme.glass_hover(),
+                    ))
+                    .on_hover(motion::hover_listener("titlebar-toggle-context"))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|workspace, _, window, cx| {
@@ -2560,28 +2988,37 @@ impl Workspace {
                     .child(
                         icon(icons::SIDEBAR_MINIMALISTIC)
                             .size(px(16.0))
-                            .text_color(theme.muted),
+                            .text_color(theme.text_muted),
                     ),
             )
     }
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::dark();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if motion::hover_fades_active() {
+            window.request_animation_frame();
+        }
+        if let Route::Settings(_) = self.route {
+            return self.render_settings(cx).into_any_element();
+        }
+        let theme = Theme::of(cx).clone();
         let sidebar_visible = self.ui_settings.sidebar_visible;
         let context_visible = self.ui_settings.context_pane_visible;
         let terminal_visible = self.ui_settings.terminal_visible;
-        div()
+        let root = div()
             .key_context("Workspace")
             .id("workspace-root")
             .size_full()
             .relative()
             .font_family(theme.font_sans.clone())
             .flex()
-            .bg(theme.background)
+            .bg(theme.glass())
             .text_color(theme.text)
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(|workspace, _: &OpenSettings, window, cx| {
+                workspace.open_settings(&OpenSettings, window, cx)
+            }))
             .on_action(cx.listener(Self::search_sessions))
             .on_action(cx.listener(Self::rename_selected))
             .on_action(cx.listener(|workspace, _: &NewSession, _, cx| workspace.create_session(cx)))
@@ -2604,9 +3041,8 @@ impl Render for Workspace {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .pt(px(TITLEBAR_HEIGHT))
-                    .bg(theme.background)
-                    .child(self.render_transcript())
+                    .bg(theme.bg)
+                    .child(self.render_transcript(cx))
                     .when(terminal_visible, |el| {
                         el.child(self.render_terminal_dock(cx))
                     })
@@ -2634,15 +3070,15 @@ impl Render for Workspace {
                                     .justify_center()
                                     .rounded_md()
                                     .bg(if self.busy {
-                                        theme.raised
+                                        theme.surface_raised
                                     } else {
                                         theme.accent
                                     })
                                     .text_size(px(13.))
                                     .text_color(if self.busy {
-                                        theme.faint
+                                        theme.text_faint
                                     } else {
-                                        theme.background
+                                        theme.on_accent
                                     })
                                     .hover(|style| {
                                         if self.busy {
@@ -2663,16 +3099,18 @@ impl Render for Workspace {
                     .child(
                         div()
                             .px_6()
-                            .h(px(STATUS_HEIGHT))
+                            .h(px(Theme::STATUS_STRIP_HEIGHT))
                             .flex()
                             .items_center()
                             .text_size(px(11.))
-                            .text_color(theme.faint)
+                            .text_color(theme.text_faint)
                             .child(self.status.clone()),
                     ),
             )
             .when(context_visible, |el| el.child(self.render_context_pane(cx)))
-            .child(self.render_titlebar(cx))
+            .child(self.render_titlebar(cx));
+
+        motion::fade_in("phase-app", root).into_any_element()
     }
 }
 

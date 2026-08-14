@@ -3,6 +3,32 @@ use harness_core::tools::shell::CommandTool;
 use harness_core::tools::{Tool, ToolInvocation};
 use std::sync::Arc;
 
+use crate::theme::{Appearance, Theme};
+use gpui::Hsla;
+
+pub const TERMINAL_TAB_WIDTH: f32 = 118.0;
+pub const TERMINAL_TAB_BAR_HEIGHT: f32 = 40.0;
+
+pub fn terminal_bg_for(appearance: Appearance) -> Hsla {
+    match appearance {
+        Appearance::Dark => rgb8(0x09, 0x09, 0x09),
+        Appearance::Light => rgb8(0xfa, 0xfa, 0xfa),
+    }
+}
+
+pub fn terminal_panel_bg(theme: &Theme) -> Hsla {
+    if theme.is_glass() {
+        terminal_bg_for(theme.appearance).opacity(0.4)
+    } else {
+        terminal_bg_for(theme.appearance)
+    }
+}
+
+fn rgb8(r: u8, g: u8, b: u8) -> Hsla {
+    let (h, s, l) = crate::theme::rgb_to_hsl(r as f32, g as f32, b as f32);
+    gpui::hsla(h, s, l, 1.0)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalEntry {
     pub command: String,

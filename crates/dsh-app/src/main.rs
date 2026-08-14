@@ -1,23 +1,35 @@
+mod appearance;
 mod changes;
+#[allow(dead_code)]
+mod edge_fade;
+#[allow(dead_code)]
+mod frost;
 mod icons;
 mod input;
+mod motion;
+#[allow(dead_code)]
+mod motion_math;
+#[allow(dead_code)]
 mod settings;
 mod terminal;
+#[allow(dead_code)]
 mod theme;
 mod workspace;
 
+use crate::settings::UiSettings;
+use crate::theme::Theme;
 use gpui::{
-    actions, point, px, size, App, AppContext, Bounds, KeyBinding, TitlebarOptions,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions,
+    actions, point, px, size, App, AppContext, Bounds, KeyBinding, TitlebarOptions, WindowBounds,
+    WindowOptions,
 };
 use input::{
     Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft, SelectRight,
 };
 use std::borrow::Cow;
 use workspace::{
-    CancelTurn, FocusTerminal, NewSession, NextHarness, NextSpace, PreviousHarness, PreviousSpace,
-    RenameSession, RunTerminalCommand, SaveCredential, SearchSessions, Submit, ToggleContext,
-    ToggleSidebar, ToggleTerminal, Workspace,
+    CancelTurn, CloseSettings, FocusTerminal, NewSession, NextHarness, NextSpace, OpenSettings,
+    PreviousHarness, PreviousSpace, RenameSession, RunTerminalCommand, SaveCredential,
+    SearchSessions, Submit, ToggleContext, ToggleSidebar, ToggleTerminal, Workspace,
 };
 
 const WINDOW_WIDTH: f32 = 1320.0;
@@ -50,6 +62,14 @@ fn main() {
         .with_assets(icons::Assets)
         .run(|cx: &mut App| {
             register_fonts(cx);
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let data_dir = home.join(".dsh-rs");
+            let appearance_mode = UiSettings::load(data_dir.join("ui.json"))
+                .map(|settings| settings.appearance)
+                .unwrap_or_default();
+            appearance::init(appearance_mode, data_dir, cx);
             cx.bind_keys([
                 KeyBinding::new("enter", Submit, Some("ChatInput")),
                 KeyBinding::new("enter", SearchSessions, Some("SearchInput")),
@@ -66,6 +86,8 @@ fn main() {
                 KeyBinding::new("cmd-shift-left", PreviousSpace, Some("Workspace")),
                 KeyBinding::new("cmd-shift-down", NextHarness, Some("Workspace")),
                 KeyBinding::new("cmd-shift-up", PreviousHarness, Some("Workspace")),
+                KeyBinding::new("cmd-,", OpenSettings, None),
+                KeyBinding::new("escape", CloseSettings, None),
                 KeyBinding::new("backspace", Backspace, None),
                 KeyBinding::new("delete", Delete, None),
                 KeyBinding::new("left", Left, None),
@@ -100,11 +122,12 @@ fn main() {
                             appears_transparent: true,
                             traffic_light_position: Some(point(px(14.0), px(14.0))),
                         }),
-                        window_background: WindowBackgroundAppearance::Blurred,
+                        window_background: Theme::of(cx).window_background_appearance(),
                         app_id: Some(String::from("dev.arnavdas.dsh-rs")),
                         ..Default::default()
                     },
                     |window, cx| {
+                        appearance::observe_window(window, cx).detach();
                         let workspace = cx.new(Workspace::new);
                         let input = workspace.read(cx).input.clone();
                         window.focus(&input.read(cx).focus_handle(cx), cx);
@@ -117,6 +140,7 @@ fn main() {
                     cx.activate(true);
                 })
                 .unwrap();
+            appearance::reapply_window_background(cx);
         });
 }
 

@@ -2,6 +2,21 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub mod appearance;
+pub mod providers;
+pub mod widgets;
+
+pub const SIDEBAR_MIN: f32 = 208.0;
+pub const SIDEBAR_MAX: f32 = 400.0;
+pub const SIDEBAR_DEFAULT: f32 = 256.0;
+pub const RIGHT_PANE_MIN: f32 = 360.0;
+pub const RIGHT_PANE_MAX: f32 = 760.0;
+pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
+pub const TERMINAL_MIN_HEIGHT: f32 = 160.0;
+pub const TERMINAL_MAX_VH: f32 = 0.55;
+pub const TERMINAL_ABS_MAX_HEIGHT: f32 = 2000.0;
+pub const TERMINAL_DEFAULT_HEIGHT: f32 = 280.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UiSettings {
@@ -9,6 +24,8 @@ pub struct UiSettings {
     pub context_pane_visible: bool,
     #[serde(default = "default_terminal_visible")]
     pub terminal_visible: bool,
+    #[serde(default)]
+    pub appearance: crate::appearance::AppearanceMode,
 }
 
 fn default_terminal_visible() -> bool {
@@ -21,6 +38,7 @@ impl Default for UiSettings {
             sidebar_visible: true,
             context_pane_visible: true,
             terminal_visible: true,
+            appearance: crate::appearance::AppearanceMode::System,
         }
     }
 }
@@ -77,6 +95,7 @@ mod tests {
             sidebar_visible: false,
             context_pane_visible: false,
             terminal_visible: false,
+            appearance: crate::appearance::AppearanceMode::Dark,
         };
 
         settings.save(&path).unwrap();
