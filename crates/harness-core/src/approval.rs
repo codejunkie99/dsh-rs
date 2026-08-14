@@ -140,6 +140,7 @@ impl Default for ApprovalPolicy {
                 ("echo".into(), ApprovalRule::Allow),
                 ("read_file".into(), ApprovalRule::Allow),
                 ("list_dir".into(), ApprovalRule::Allow),
+                ("todo_write".into(), ApprovalRule::Allow),
                 ("write_file".into(), ApprovalRule::Ask),
                 ("run_command".into(), ApprovalRule::Ask),
             ]),
@@ -242,6 +243,7 @@ mod tests {
         assert_eq!(policy.decide("echo"), ApprovalDecision::Allow);
         assert_eq!(policy.decide("read_file"), ApprovalDecision::Allow);
         assert_eq!(policy.decide("list_dir"), ApprovalDecision::Allow);
+        assert_eq!(policy.decide("todo_write"), ApprovalDecision::Allow);
         assert_eq!(policy.decide("write_file"), ApprovalDecision::Ask);
         assert_eq!(policy.decide("shell"), ApprovalDecision::Deny);
     }

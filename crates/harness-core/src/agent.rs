@@ -267,7 +267,9 @@ impl AgentLoop {
 
         let call_id = invocation.call_id.clone();
         let output = if approved {
-            self.tools.execute(invocation).await
+            self.tools
+                .execute_with_session(invocation, Some(log.clone()))
+                .await
         } else {
             crate::tools::ToolOutput {
                 ok: false,
@@ -376,6 +378,7 @@ mod tests {
     use crate::approval::{ApprovalPolicy, ApprovalRule, PolicyApprover};
     use crate::llm::NullAdapter;
     use crate::tools::EchoTool;
+    use crate::tools::TodoTool;
     use crate::tools::ToolInvocation;
 
     #[tokio::test]
@@ -504,6 +507,35 @@ mod tests {
             EventKind::ToolResult { call_id, ok, output }
                 if call_id == "call_approval" && !ok && output.contains("requires explicit approval")
         )));
+    }
+
+    #[tokio::test]
+    async fn tools_receive_the_owning_session_for_durable_side_effects() {
+        let log = Arc::new(SessionLog::in_memory(Uuid::new_v4()));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(TodoTool::new(true)));
+        let agent = AgentLoop::new(Arc::new(NullAdapter), Arc::new(tools));
+
+        agent
+            .execute_tool(
+                log.clone(),
+                ToolInvocation {
+                    call_id: "call_todo".into(),
+                    name: "todo_write".into(),
+                    arguments: serde_json::json!({
+                        "todos": [{"content": "port todo", "status": "in_progress"}]
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(log.events().iter().any(|event| matches!(
+            &event.kind,
+            EventKind::TodoWrite { todos }
+                if todos.len() == 1 && todos[0].content == "port todo"
+        )));
+        assert_eq!(log.view().todos.as_deref().unwrap().len(), 1);
     }
 
     #[test]

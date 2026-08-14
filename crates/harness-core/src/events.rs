@@ -1,7 +1,35 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+pub fn validate_todo_snapshot(todos: &[TodoItem]) -> anyhow::Result<()> {
+    let mut seen = HashSet::new();
+    for todo in todos {
+        if todo.content.trim() != todo.content || todo.content.is_empty() {
+            anyhow::bail!("todo content must be non-empty and already trimmed");
+        }
+        if !seen.insert(todo.content.as_str()) {
+            anyhow::bail!("todo list repeats content {:?}", todo.content);
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
@@ -46,6 +74,9 @@ pub enum EventKind {
         content: String,
         stop_reason: Option<String>,
         usage: Option<Usage>,
+    },
+    TodoWrite {
+        todos: Vec<TodoItem>,
     },
     ToolCall {
         id: String,
