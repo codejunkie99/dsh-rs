@@ -1,7 +1,9 @@
 pub mod fs;
 pub mod shell;
+pub mod skill;
 pub mod todo;
 
+pub use skill::SkillTool;
 pub use todo::TodoTool;
 
 use async_trait::async_trait;

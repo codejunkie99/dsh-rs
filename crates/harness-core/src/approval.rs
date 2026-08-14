@@ -141,6 +141,7 @@ impl Default for ApprovalPolicy {
                 ("read_file".into(), ApprovalRule::Allow),
                 ("list_dir".into(), ApprovalRule::Allow),
                 ("todo_write".into(), ApprovalRule::Allow),
+                ("skill".into(), ApprovalRule::Allow),
                 ("write_file".into(), ApprovalRule::Ask),
                 ("run_command".into(), ApprovalRule::Ask),
             ]),

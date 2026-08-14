@@ -30,11 +30,12 @@ use harness_core::harness::{HarnessSetup, HarnessSetupsConfig};
 use harness_core::prompt::SystemPromptConfig;
 use harness_core::remote::{CredentialStore, ModelSelection};
 use harness_core::session::{SessionView, TranscriptEntry};
+use harness_core::skills::{FileSystemSkillProvider, SkillFileSystemConfig, SkillRegistry};
 use harness_core::spaces::SpacesConfig;
 use harness_core::store::{SessionStore, SessionSummary};
 use harness_core::tools::fs::{ListDirTool, ReadFileTool, ScopedFs, WriteFileTool};
 use harness_core::tools::shell::{CommandTool, ShellPolicy};
-use harness_core::tools::{EchoTool, TodoTool, ToolRegistry};
+use harness_core::tools::{EchoTool, SkillTool, TodoTool, ToolRegistry};
 use zeroize::Zeroize;
 
 const TITLEBAR_CLUSTER_BUTTONS_WIDTH: f32 = 24.0 * 3.0 + 2.0 * 2.0;
@@ -630,6 +631,23 @@ impl Workspace {
         }
         if harness.enables("todo_write") {
             tools.register(Arc::new(TodoTool::new(true)));
+        }
+        if harness.enables("skill") {
+            let mut skills = SkillRegistry::new();
+            let provider = FileSystemSkillProvider::new(SkillFileSystemConfig {
+                include_default_roots: true,
+                dsh_home: home.join(".dsh"),
+                agents_home: home.join(".agents"),
+                custom_skill_dirs: Vec::new(),
+                bundled_skill_dir: None,
+            });
+            if let Ok(provider) = provider {
+                if skills.register_provider(Arc::new(provider)).is_ok() {
+                    tools.register(Arc::new(
+                        SkillTool::new(Arc::new(skills)).with_cwd(workspace_root),
+                    ));
+                }
+            }
         }
 
         let needs_filesystem = ["read_file", "list_dir", "write_file", "run_command"]
@@ -3935,6 +3953,17 @@ mod tests {
             Workspace::build_tools(home.path(), root.path(), setups.get("standard").unwrap());
 
         assert!(tools.specs().iter().any(|spec| spec.name == "todo_write"));
+    }
+
+    #[test]
+    fn build_tools_registers_the_standard_skill_loader() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let setups = HarnessSetupsConfig::default();
+        let tools =
+            Workspace::build_tools(home.path(), root.path(), setups.get("standard").unwrap());
+
+        assert!(tools.specs().iter().any(|spec| spec.name == "skill"));
     }
 
     #[test]
