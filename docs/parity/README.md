@@ -26,3 +26,8 @@ black frame for both the Rust app and the known-good packaged binary.
 The durable DSH Todo projection now drives a Comet-style transcript checklist
 card and the DSH plan strip above the composer. Comet's exact tool chip,
 animated progress glyph, and rendered comparison remain open.
+The durable DSH skill call now renders through the native tool-row language:
+exact 16px skill glyph at 14px, 24px Bash-shaped rhythm, replay-stable name and
+result state, first-line error summary, bounded Instructions disclosure, and a
+2.6s running sweep. Exact hover-chevron replacement, keyboard disclosure,
+Inspect handoff, and rendered comparison remain open.

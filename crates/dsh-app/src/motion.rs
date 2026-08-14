@@ -315,6 +315,8 @@ pub const HOVER_FADE: MotionSpec = MotionSpec::new(150, EASE_TAILWIND);
 pub const COMET_PULSE: MotionSpec = MotionSpec::new(2400, EASE);
 /// Gradient matrix spinner wave period: 750ms.
 pub const GRADIENT_SPIN: MotionSpec = MotionSpec::new(750, EASE);
+/// DSH skill tool-row sweep period: 2.6s ease-out.
+pub const SKILL_SWEEP: MotionSpec = MotionSpec::new(2600, EASE_OUT);
 
 // ---------------------------------------------------------------------------
 // Element helpers (paint-layer entrances/exits)
@@ -405,6 +407,13 @@ pub use crate::motion_math::{
 pub fn matrix_wave(raw_delta: f32, wave_index: usize, wave_count: usize) -> f32 {
     let count = wave_count.max(1) as f32;
     pulse_wave(staggered_phase(raw_delta, wave_index, 1.0 / count))
+}
+
+/// Horizontal offset of the DSH skill-row's 300px running sweep. The CSS
+/// timeline reaches the row's right edge at 90% and holds there through 100%.
+pub fn skill_sweep_left(raw_delta: f32) -> f32 {
+    let keyframe = (raw_delta.clamp(0.0, 1.0) / 0.9).min(1.0);
+    lerp(-300.0, 820.0, EASE_OUT.eval(keyframe))
 }
 
 /// Linear interpolation (layout tweens).
@@ -763,6 +772,24 @@ mod tests {
         assert_eq!(COMET_PULSE.duration_ms, 2400);
         assert_eq!(GRADIENT_SPIN.duration_ms, 750);
         assert_eq!(EASE_OUT_EXPO, CubicBezier::new(0.16, 1.0, 0.3, 1.0));
+    }
+
+    #[test]
+    fn skill_sweep_matches_the_dsh_tool_row() {
+        assert_eq!(SKILL_SWEEP.duration_ms, 2600);
+        assert_close(skill_sweep_left(0.0), -300.0, 1e-6, "sweep enters off-row");
+        assert_close(skill_sweep_left(0.9), 820.0, 1e-6, "sweep exits at 90%");
+        assert_close(
+            skill_sweep_left(1.0),
+            820.0,
+            1e-6,
+            "sweep holds through end",
+        );
+        assert!(
+            skill_sweep_left(0.45) > skill_sweep_left(0.0)
+                && skill_sweep_left(0.45) < skill_sweep_left(0.9),
+            "sweep advances monotonically"
+        );
     }
 
     #[test]
