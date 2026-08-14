@@ -40,6 +40,7 @@ pub struct SessionView {
     pub title: String,
     pub model: Option<String>,
     pub space_id: Option<String>,
+    pub harness_id: Option<String>,
     pub system_prompt: Option<String>,
     pub created_at: chrono::DateTime<Utc>,
     pub updated_at: chrono::DateTime<Utc>,
@@ -64,6 +65,7 @@ struct SessionInner {
     title: String,
     model: Option<String>,
     space_id: Option<String>,
+    harness_id: Option<String>,
     system_prompt: Option<String>,
     turn_active: bool,
     step_active: bool,
@@ -85,6 +87,7 @@ impl SessionLog {
                 title: "New session".into(),
                 model: None,
                 space_id: None,
+                harness_id: None,
                 system_prompt: None,
                 turn_active: false,
                 step_active: false,
@@ -189,6 +192,18 @@ impl SessionLog {
         self.append(EventKind::SessionSpaceChanged { space_id })
     }
 
+    pub fn set_harness(&self, harness_id: impl Into<String>) -> Result<SessionEvent> {
+        let harness_id = harness_id.into();
+        if self.view().harness_id.as_deref() == Some(harness_id.as_str()) {
+            return Ok(self
+                .events()
+                .last()
+                .cloned()
+                .expect("session logs always contain at least one event"));
+        }
+        self.append(EventKind::SessionHarnessChanged { harness_id })
+    }
+
     pub fn append_with_metadata(
         &self,
         kind: EventKind,
@@ -221,6 +236,7 @@ impl SessionLog {
             title: inner.title.clone(),
             model: inner.model.clone(),
             space_id: inner.space_id.clone(),
+            harness_id: inner.harness_id.clone(),
             system_prompt: inner.system_prompt.clone(),
             created_at: inner
                 .events
@@ -302,6 +318,7 @@ impl SessionLog {
                 title,
                 model,
                 space_id,
+                harness_id,
             } => {
                 if let Some(title) = title {
                     inner.title = title.clone();
@@ -310,11 +327,17 @@ impl SessionLog {
                 if space_id.is_some() {
                     inner.space_id = space_id.clone();
                 }
+                if harness_id.is_some() {
+                    inner.harness_id = harness_id.clone();
+                }
             }
             EventKind::SessionTitleChanged { title } => inner.title = title.clone(),
             EventKind::SessionModelChanged { model } => inner.model = Some(model.clone()),
             EventKind::SessionSpaceChanged { space_id } => {
                 inner.space_id = Some(space_id.clone());
+            }
+            EventKind::SessionHarnessChanged { harness_id } => {
+                inner.harness_id = Some(harness_id.clone());
             }
             EventKind::SystemPromptSnapshot { content } => inner.system_prompt = content.clone(),
             EventKind::TurnStarted => inner.turn_active = true,
@@ -380,6 +403,7 @@ mod tests {
             title: Some("Test".into()),
             model: Some("test-model".into()),
             space_id: None,
+            harness_id: None,
         })
         .unwrap();
         log.append(EventKind::UserMessage {
@@ -411,6 +435,7 @@ mod tests {
             title: Some("Persisted".into()),
             model: None,
             space_id: None,
+            harness_id: None,
         })
         .unwrap();
         log.append(EventKind::UserMessage {
@@ -453,6 +478,7 @@ mod tests {
             title: Some("Model test".into()),
             model: Some("local-null".into()),
             space_id: None,
+            harness_id: None,
         })
         .unwrap();
         log.set_model("deepseek-chat").unwrap();
@@ -472,6 +498,7 @@ mod tests {
             title: Some("Space test".into()),
             model: Some("local-null".into()),
             space_id: Some("local".into()),
+            harness_id: None,
         })
         .unwrap();
         log.append(EventKind::SessionSpaceChanged {
@@ -496,6 +523,43 @@ mod tests {
         .unwrap();
         let legacy = SessionLog::open(legacy_path).unwrap();
         assert_eq!(legacy.view().space_id, None);
+    }
+
+    #[test]
+    fn harness_changes_are_durable_and_old_sessions_replay_without_a_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let path = dir.path().join(format!("{id}.jsonl"));
+        let log = SessionLog::with_path(id, Some(path.clone()));
+        log.append(EventKind::SessionStarted {
+            title: Some("Harness test".into()),
+            model: Some("local-null".into()),
+            space_id: Some("local".into()),
+            harness_id: Some("standard".into()),
+        })
+        .unwrap();
+        log.append(EventKind::SessionHarnessChanged {
+            harness_id: "research".into(),
+        })
+        .unwrap();
+        drop(log);
+
+        let reopened = SessionLog::open(path).unwrap();
+        assert_eq!(reopened.view().harness_id.as_deref(), Some("research"));
+
+        let legacy_id = Uuid::new_v4();
+        let legacy_path = dir.path().join(format!("{legacy_id}.jsonl"));
+        std::fs::write(
+            &legacy_path,
+            format!(
+                r#"{{"seq":1,"id":"{}","session_id":"{}","timestamp":"2026-08-14T00:00:00Z","type":"session_started","data":{{"title":"Legacy","model":null}}}}"#,
+                Uuid::new_v4(),
+                legacy_id
+            ),
+        )
+        .unwrap();
+        let legacy = SessionLog::open(legacy_path).unwrap();
+        assert_eq!(legacy.view().harness_id, None);
     }
 
     #[test]

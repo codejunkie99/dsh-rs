@@ -23,6 +23,8 @@ A native Rust + GPUI desktop milestone for the DeepSeek Harness agent model. It 
 - Tool registry and echo tool execution path.
 - Multiple configured spaces with durable per-session space associations. Read/list filesystem tools are confined to the selected space; traversal and symlink escapes are rejected.
 - Keyboard space cycling with `Cmd+Shift+Right` and `Cmd+Shift+Left`.
+- Durable harness setups with prompt, tool allowlist, and step-budget primitives. New sessions and forks preserve the selected setup.
+- Keyboard harness cycling with `Cmd+Shift+Down` and `Cmd+Shift+Up`.
 - Durable fail-closed approval policy with native GPUI Approve/Deny prompts for `ask` tools.
 - Responsive turn cancellation with a durable cancelled turn event and native Cancel control.
 - Optional direct-execution shell tool with canonical binary allowlist, cleared environment, workspace cwd, timeout, and bounded output.
@@ -83,6 +85,41 @@ Spaces are defined in `~/.dsh-rs/spaces.json`. Roots must be existing absolute d
 The first entry is the fail-safe default. Selecting a space records a durable `session_space_changed` event on the current session; new sessions and forks preserve the active space. Filesystem tools, shell cwd, and Git scanning all use that space's root. Invalid or empty configurations fall back to the local harness without widening filesystem scope.
 
 Press `Cmd+Shift+Right` to activate the next space or `Cmd+Shift+Left` to activate the previous one. Space rows are also directly clickable.
+
+## Harness Setups
+
+Harness setups are defined in `~/.dsh-rs/harness-setups.json`. A setup is a native composition of three primitives: a system prompt, an explicit tool allowlist, and a bounded model step budget.
+
+```json
+{
+  "setups": [
+    {
+      "id": "research",
+      "name": "Research",
+      "system_prompt": {
+        "include_harness_identity": true,
+        "persona": "Read the selected workspace and answer from evidence. Do not mutate files."
+      },
+      "enabled_tools": ["echo", "read_file", "list_dir"],
+      "max_steps": 4
+    }
+  ]
+}
+```
+
+Supported tool IDs are:
+
+- `echo`
+- `read_file`
+- `list_dir`
+- `write_file`
+- `run_command`
+
+The built-in `standard`, `research`, and `minimal` setups are written on first launch. Invalid, empty, duplicate, unknown-tool, or out-of-range configurations fail closed to those defaults. A customized `system-prompt.json` is migrated into the `standard` setup.
+
+Selecting a setup records a durable `session_harness_changed` event. New sessions use the selected setup, session reopen restores it, and forks preserve it. The setup controls the tools exposed to the model, the prompt sent on the next turn, and the maximum number of model steps. `run_command` still requires the shell policy and approval policy below.
+
+Press `Cmd+Shift+Down` to activate the next setup or `Cmd+Shift+Up` to activate the previous one. Setup rows are also directly clickable.
 
 The sidebar search field filters titles and transcript content. Enter in the rename field updates the selected session title as a durable `session_title_changed` event.
 
@@ -199,4 +236,5 @@ This build uses GPUI's `runtime_shaders` feature so it can build and run with th
 
 - Remote streaming retries are implemented, but circuit-break telemetry is not implemented yet.
 - The editor is a focused native single-line chat input, not a full multiline code editor.
-- Read/list/write filesystem tools are scoped and enabled. Shell execution is direct-execution and explicitly allowlisted, not a general `/bin/sh` sandbox. OS-level sandbox profiles remain future work.
+- Harness setups are selectable and durable, but setup authoring is JSON-file based rather than a full visual editor.
+- Read/list/write filesystem tools are scoped and enabled according to the selected setup. Shell execution is direct-execution and explicitly allowlisted, not a general `/bin/sh` sandbox. OS-level sandbox profiles remain future work.

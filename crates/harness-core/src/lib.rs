@@ -2,6 +2,7 @@ pub mod agent;
 pub mod approval;
 pub mod cancellation;
 pub mod events;
+pub mod harness;
 pub mod llm;
 pub mod prompt;
 pub mod remote;
