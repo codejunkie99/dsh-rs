@@ -132,6 +132,7 @@ icon_assets![
     // Harness brand marks (icons.tsx).
     (CLAUDE_MARK, "claude-mark"),
     (OPENAI_MARK, "openai-mark"),
+    (DEEPSEEK_MARK, "deepseek-mark"),
     (CURSOR_MARK, "cursor-mark"),
     (GROK_MARK, "grok-mark"),
     (HERMES_MARK, "hermes-mark"),
