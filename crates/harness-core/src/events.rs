@@ -9,12 +9,17 @@ pub enum EventKind {
     SessionStarted {
         title: Option<String>,
         model: Option<String>,
+        #[serde(default)]
+        space_id: Option<String>,
     },
     SessionTitleChanged {
         title: String,
     },
     SessionModelChanged {
         model: String,
+    },
+    SessionSpaceChanged {
+        space_id: String,
     },
     SystemPromptSnapshot {
         content: Option<String>,

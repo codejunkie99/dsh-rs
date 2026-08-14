@@ -16,4 +16,5 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
 tempfile = "3"

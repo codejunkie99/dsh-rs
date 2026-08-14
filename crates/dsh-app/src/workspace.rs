@@ -17,6 +17,7 @@ use harness_core::cancellation::TurnCancellation;
 use harness_core::prompt::SystemPromptConfig;
 use harness_core::remote::{CredentialStore, ModelSelection};
 use harness_core::session::{SessionView, TranscriptEntry};
+use harness_core::spaces::SpacesConfig;
 use harness_core::store::{SessionStore, SessionSummary};
 use harness_core::tools::fs::{ListDirTool, ReadFileTool, ScopedFs, WriteFileTool};
 use harness_core::tools::shell::{CommandTool, ShellPolicy};
@@ -33,7 +34,9 @@ actions!(
         RenameSession,
         SaveCredential,
         ToggleSidebar,
-        ToggleContext
+        ToggleContext,
+        NextSpace,
+        PreviousSpace
     ]
 );
 
@@ -53,6 +56,8 @@ pub struct Workspace {
     ui_settings: UiSettings,
     ui_settings_path: std::path::PathBuf,
     home: std::path::PathBuf,
+    spaces_config: SpacesConfig,
+    selected_space_id: String,
     workspace_root: std::path::PathBuf,
     credential_path: std::path::PathBuf,
     credential_environment_override: bool,
@@ -88,6 +93,17 @@ impl Workspace {
         let credential_file_configured = CredentialStore::resolve(None, &credential_path).is_ok();
         let workspace_root = home.join(".dsh-rs").join("workspace");
         let _ = std::fs::create_dir_all(&workspace_root);
+        let spaces_path = home.join(".dsh-rs").join("spaces.json");
+        let (spaces_config, spaces_error) = Self::load_spaces(&spaces_path, &workspace_root);
+        let selected_space_id = spaces_config
+            .spaces()
+            .first()
+            .map(|space| space.id().to_string())
+            .unwrap_or_else(|| "local".to_string());
+        let workspace_root = spaces_config
+            .get(&selected_space_id)
+            .map(|space| space.root().to_path_buf())
+            .unwrap_or(workspace_root);
         let ui_settings_path = home.join(".dsh-rs").join("ui.json");
         let ui_settings = if ui_settings_path.exists() {
             UiSettings::load(&ui_settings_path).unwrap_or_else(|error| {
@@ -150,8 +166,15 @@ impl Workspace {
                 )
             }
         };
+        let status = if let Some(error) = spaces_error {
+            SharedString::from(format!(
+                "{status}. Spaces config failed ({error}); using Local harness."
+            ))
+        } else {
+            status
+        };
 
-        let tools = Self::build_tools(&home);
+        let tools = Self::build_tools(&home, &workspace_root);
         let agent = AgentLoop::new(selection.adapter.clone(), tools.clone())
             .with_default_model(Some(selection.model.clone()))
             .with_system_prompt(system_prompt.clone())
@@ -174,6 +197,8 @@ impl Workspace {
             ui_settings,
             ui_settings_path,
             home,
+            spaces_config,
+            selected_space_id,
             workspace_root,
             credential_path,
             credential_environment_override,
@@ -245,10 +270,10 @@ impl Workspace {
         cx.notify();
     }
 
-    fn build_tools(home: &std::path::Path) -> Arc<ToolRegistry> {
+    fn build_tools(home: &std::path::Path, workspace_root: &std::path::Path) -> Arc<ToolRegistry> {
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(EchoTool));
-        if let Ok(filesystem) = ScopedFs::new(home.join(".dsh-rs").join("workspace")) {
+        if let Ok(filesystem) = ScopedFs::new(workspace_root) {
             let filesystem = Arc::new(filesystem);
             tools.register(Arc::new(ReadFileTool::new(filesystem.clone())));
             tools.register(Arc::new(ListDirTool::new(filesystem.clone())));
@@ -270,6 +295,49 @@ impl Workspace {
             }
         }
         Arc::new(tools)
+    }
+
+    fn load_spaces(
+        path: &std::path::Path,
+        local_root: &std::path::Path,
+    ) -> (SpacesConfig, Option<String>) {
+        let local = SpacesConfig::local(local_root);
+        if !path.exists() {
+            if let Err(error) = local.save(path) {
+                return (local, Some(error.to_string()));
+            }
+            return (local, None);
+        }
+
+        match SpacesConfig::load(path) {
+            Ok(config) => (config, None),
+            Err(error) => (local, Some(error.to_string())),
+        }
+    }
+
+    fn resolve_space_id(config: &SpacesConfig, session_space_id: Option<&str>) -> String {
+        session_space_id
+            .filter(|id| config.get(id).is_some())
+            .map(str::to_string)
+            .or_else(|| config.spaces().first().map(|space| space.id().to_string()))
+            .unwrap_or_else(|| "local".to_string())
+    }
+
+    fn cycled_space_id(
+        config: &SpacesConfig,
+        current_space_id: &str,
+        forward: bool,
+    ) -> Option<String> {
+        let spaces = config.spaces();
+        let index = spaces
+            .iter()
+            .position(|space| space.id() == current_space_id)?;
+        let next = if forward {
+            index + 1
+        } else {
+            index + spaces.len().saturating_sub(1)
+        } % spaces.len();
+        Some(spaces[next].id().to_string())
     }
 
     fn reload_model(&mut self) -> Result<(), String> {
@@ -455,7 +523,11 @@ impl Workspace {
     }
 
     fn create_session(&mut self, cx: &mut Context<Self>) {
-        match self.store.create("New session", Some(self.model.clone())) {
+        let space_id = self.selected_space_id.clone();
+        match self
+            .store
+            .create_in_space("New session", Some(self.model.clone()), Some(space_id))
+        {
             Ok(log) => {
                 self.selected = Some(log);
                 self.search_matches = None;
@@ -475,6 +547,8 @@ impl Workspace {
             self.status = SharedString::from("Wait for the current turn to finish.");
         } else if let Some(log) = self.store.get(id) {
             self.selected = Some(log);
+            self.activate_space_for_selection();
+            self.refresh_changes(cx);
             self.status = SharedString::from("Session loaded.");
             self.refresh();
             self.sync_rename_input(cx);
@@ -482,6 +556,72 @@ impl Workspace {
             self.status = SharedString::from("Session no longer exists.");
         }
         cx.notify();
+    }
+
+    fn activate_space_for_selection(&mut self) {
+        let Some(view) = self.selected.as_ref().map(|log| log.view()) else {
+            return;
+        };
+        let space_id = Self::resolve_space_id(&self.spaces_config, view.space_id.as_deref());
+        if let Some(space) = self.spaces_config.get(&space_id) {
+            self.workspace_root = space.root().to_path_buf();
+            self.tools = Self::build_tools(&self.home, &self.workspace_root);
+            if let Err(error) = self.reload_model() {
+                self.status = SharedString::from(format!(
+                    "Space activated, but model reload failed: {error}"
+                ));
+            }
+        }
+        self.selected_space_id = space_id;
+    }
+
+    fn select_space(&mut self, space_id: &str, cx: &mut Context<Self>) {
+        if self.busy {
+            self.status = SharedString::from("Wait for the current turn to finish.");
+            cx.notify();
+            return;
+        }
+        let Some(space) = self.spaces_config.get(space_id).cloned() else {
+            self.status = SharedString::from("Space no longer exists.");
+            cx.notify();
+            return;
+        };
+
+        self.workspace_root = space.root().to_path_buf();
+        self.tools = Self::build_tools(&self.home, &self.workspace_root);
+        if let Err(error) = self.reload_model() {
+            self.status = SharedString::from(format!("Could not activate space: {error}"));
+            cx.notify();
+            return;
+        }
+        self.selected_space_id = space_id.to_string();
+        if let Some(selected) = &self.selected {
+            if let Err(error) = selected.set_space(space_id) {
+                self.status = SharedString::from(format!("Could not save session space: {error}"));
+                cx.notify();
+                return;
+            }
+        }
+        self.refresh();
+        self.refresh_changes(cx);
+        self.status = SharedString::from(format!("{} space active.", space.name()));
+        cx.notify();
+    }
+
+    fn cycle_space(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Some(next) =
+            Self::cycled_space_id(&self.spaces_config, &self.selected_space_id, forward)
+        {
+            self.select_space(&next, cx);
+        }
+    }
+
+    fn next_space(&mut self, _: &NextSpace, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_space(true, cx);
+    }
+
+    fn previous_space(&mut self, _: &PreviousSpace, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_space(false, cx);
     }
 
     fn sync_rename_input(&mut self, cx: &mut Context<Self>) {
@@ -765,26 +905,59 @@ impl Workspace {
                             .child("New"),
                     ),
             )
-            .child(
-                div()
-                    .id("local-space")
-                    .w_full()
-                    .px_2()
-                    .py_2()
-                    .rounded_sm()
-                    .bg(theme.raised)
-                    .child(
+            .children(
+                self.spaces_config
+                    .spaces()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, space)| {
+                        let id = space.id().to_string();
+                        let selected = self.selected_space_id == id;
                         div()
-                            .text_size(px(13.))
-                            .text_color(theme.text)
-                            .child("Local harness"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(theme.faint)
-                            .child("This Mac"),
-                    ),
+                            .id(("space", index))
+                            .w_full()
+                            .px_2()
+                            .py_2()
+                            .rounded_sm()
+                            .border_l_2()
+                            .border_color(if selected { theme.accent } else { theme.border })
+                            .bg(if selected {
+                                theme.raised
+                            } else {
+                                theme.surface
+                            })
+                            .hover(|style| style.bg(theme.raised).cursor_pointer())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |workspace, _, _, cx| {
+                                    workspace.select_space(&id.clone(), cx)
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(theme.text)
+                                    .child(space.name().to_string()),
+                            )
+                            .child(div().text_size(px(11.)).text_color(theme.faint).child({
+                                let root = space.root().display().to_string();
+                                if root.chars().count() > 34 {
+                                    format!(
+                                        "{}...{}",
+                                        root.chars().take(18).collect::<String>(),
+                                        root.chars()
+                                            .rev()
+                                            .take(13)
+                                            .collect::<Vec<_>>()
+                                            .into_iter()
+                                            .rev()
+                                            .collect::<String>()
+                                    )
+                                } else {
+                                    root
+                                }
+                            }))
+                    }),
             )
             .child(self.search_input.clone())
             .child(self.rename_input.clone())
@@ -941,7 +1114,11 @@ impl Workspace {
                             .text_size(px(11.))
                             .text_color(theme.faint)
                             .child(format!(
-                                "{} · {} events{}",
+                                "{} · {} · {} events{}",
+                                self.spaces_config
+                                    .get(summary.space_id.as_deref().unwrap_or_default())
+                                    .map(|space| space.name())
+                                    .unwrap_or("Local harness"),
                                 summary.model.as_deref().unwrap_or("no model"),
                                 summary.event_count,
                                 if summary.turn_active {
@@ -1672,6 +1849,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::cancel_turn))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_context))
+            .on_action(cx.listener(Self::next_space))
+            .on_action(cx.listener(Self::previous_space))
             .when(sidebar_visible, |el| el.child(self.render_sidebar(cx)))
             .child(
                 div()
@@ -1794,5 +1973,95 @@ impl Render for Workspace {
                     ),
             )
             .when(context_visible, |el| el.child(self.render_context_pane(cx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_core::spaces::SpacesConfig;
+    use harness_core::tools::ToolInvocation;
+
+    #[test]
+    fn build_tools_reads_from_the_selected_space_root() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("hello.txt"), "selected root").unwrap();
+
+        let tools = Workspace::build_tools(home.path(), root.path());
+        let output = futures::executor::block_on(tools.execute(ToolInvocation {
+            call_id: "test".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "hello.txt"}),
+        }));
+
+        assert!(output.ok);
+        assert_eq!(output.output, "selected root");
+    }
+
+    #[test]
+    fn spaces_config_load_fails_closed_to_local() {
+        let home = tempfile::tempdir().unwrap();
+        let local_root = home.path().join("workspace");
+        std::fs::create_dir_all(&local_root).unwrap();
+        let path = home.path().join("spaces.json");
+        let local = SpacesConfig::local(&local_root);
+
+        let (loaded, error) = Workspace::load_spaces(&path, &local_root);
+        assert_eq!(loaded, local);
+        assert!(error.is_none());
+
+        std::fs::write(&path, "{invalid").unwrap();
+        let (fallback, error) = Workspace::load_spaces(&path, &local_root);
+        assert_eq!(fallback, local);
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn session_space_references_resolve_safely() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let config = SpacesConfig::parse(&format!(
+            r#"{{"spaces":[{{"id":"local","name":"Local","root":{:?}}},{{"id":"project","name":"Project","root":{:?}}}]}}"#,
+            first.path(),
+            second.path()
+        ))
+        .unwrap();
+
+        assert_eq!(
+            Workspace::resolve_space_id(&config, Some("project")),
+            "project"
+        );
+        assert_eq!(Workspace::resolve_space_id(&config, None), "local");
+        assert_eq!(
+            Workspace::resolve_space_id(&config, Some("missing")),
+            "local"
+        );
+    }
+
+    #[test]
+    fn space_selection_cycles_forward_and_backward() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let config = SpacesConfig::parse(&format!(
+            r#"{{"spaces":[{{"id":"local","name":"Local","root":{:?}}},{{"id":"project","name":"Project","root":{:?}}}]}}"#,
+            first.path(),
+            second.path()
+        ))
+        .unwrap();
+
+        assert_eq!(
+            Workspace::cycled_space_id(&config, "local", true),
+            Some("project".to_string())
+        );
+        assert_eq!(
+            Workspace::cycled_space_id(&config, "project", true),
+            Some("local".to_string())
+        );
+        assert_eq!(
+            Workspace::cycled_space_id(&config, "project", false),
+            Some("local".to_string())
+        );
+        assert_eq!(Workspace::cycled_space_id(&config, "missing", false), None);
     }
 }
