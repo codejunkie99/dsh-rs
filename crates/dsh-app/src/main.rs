@@ -1,3 +1,4 @@
+mod changes;
 mod input;
 mod settings;
 mod theme;
