@@ -7,7 +7,7 @@ mod theme;
 mod workspace;
 
 use gpui::{
-    actions, point, px, size, App, AppContext, Application, Bounds, KeyBinding, TitlebarOptions,
+    actions, point, px, size, App, AppContext, Bounds, KeyBinding, TitlebarOptions,
     WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 use input::{
@@ -46,7 +46,7 @@ fn register_fonts(cx: &mut App) {
 }
 
 fn main() {
-    Application::new()
+    gpui_platform::application()
         .with_assets(icons::Assets)
         .run(|cx: &mut App| {
             register_fonts(cx);
@@ -81,7 +81,7 @@ fn main() {
                 KeyBinding::new("cmd-q", Quit, None),
             ]);
 
-            cx.on_window_closed(|cx| {
+            cx.on_window_closed(|cx, _window_id| {
                 if cx.windows().is_empty() {
                     cx.quit();
                 }
@@ -107,7 +107,7 @@ fn main() {
                     |window, cx| {
                         let workspace = cx.new(Workspace::new);
                         let input = workspace.read(cx).input.clone();
-                        window.focus(&input.read(cx).focus_handle(cx));
+                        window.focus(&input.read(cx).focus_handle(cx), cx);
                         workspace
                     },
                 )

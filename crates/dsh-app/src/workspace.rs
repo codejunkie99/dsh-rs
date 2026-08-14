@@ -278,22 +278,17 @@ impl Workspace {
         let workspace_handle = cx.entity();
         cx.spawn(async move |_, cx| {
             while let Some(request) = approval_requests.recv().await {
-                if cx
-                    .update(|cx| {
-                        workspace_handle.update(cx, |workspace, cx| {
-                            workspace.pending_approval = Some(request);
-                            workspace.status = SharedString::from(format!(
-                                "Approval required for {} ({})",
-                                workspace.pending_approval.as_ref().unwrap().tool_name,
-                                workspace.pending_approval.as_ref().unwrap().call_id
-                            ));
-                            cx.notify();
-                        });
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+                cx.update(|cx| {
+                    workspace_handle.update(cx, |workspace, cx| {
+                        workspace.pending_approval = Some(request);
+                        workspace.status = SharedString::from(format!(
+                            "Approval required for {} ({})",
+                            workspace.pending_approval.as_ref().unwrap().tool_name,
+                            workspace.pending_approval.as_ref().unwrap().call_id
+                        ));
+                        cx.notify();
+                    });
+                });
             }
         })
         .detach();
@@ -638,7 +633,7 @@ impl Workspace {
             } else {
                 None
             };
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 workspace_handle.update(cx, |workspace, cx| {
                     workspace.changes = state;
                     workspace.changes_scanning = false;
@@ -681,7 +676,7 @@ impl Workspace {
                     async move { WorkspaceChanges::diff_blocking(root, &path, staged) },
                 )
                 .await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 workspace_handle.update(cx, |workspace, cx| {
                     workspace.diff_loading = false;
                     match result {
@@ -877,7 +872,7 @@ impl Workspace {
             }
         }
         let focus = self.terminal_input.read(cx).focus_handle(cx);
-        window.focus(&focus);
+        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -947,7 +942,7 @@ impl Workspace {
                 SharedString::from("Command failed.")
             };
 
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 workspace_handle.update(cx, |workspace, cx| {
                     workspace.terminal_history.push(entry);
                     workspace.terminal_running = false;
@@ -1110,7 +1105,7 @@ impl Workspace {
                     result = &mut *turn => break result,
                     changed = sequence.changed() => {
                         if changed.is_ok() {
-                            let _ = cx.update(|cx| {
+                            cx.update(|cx| {
                                 workspace.update(cx, |workspace, cx| {
                                     workspace.refresh();
                                     cx.notify();
@@ -1121,7 +1116,7 @@ impl Workspace {
                 }
             };
 
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 workspace.update(cx, |workspace, cx| {
                     workspace.busy = false;
                     workspace.cancellation = None;

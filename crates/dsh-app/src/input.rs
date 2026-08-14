@@ -510,8 +510,15 @@ impl Element for ChatTextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        line.paint(bounds.origin, window.line_height(), window, cx)
-            .ok();
+        line.paint(
+            bounds.origin,
+            window.line_height(),
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        )
+        .ok();
         if focus_handle.is_focused(window) {
             if let Some(cursor) = cursor {
                 window.paint_quad(cursor);
