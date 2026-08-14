@@ -195,6 +195,8 @@ pub struct Workspace {
     skill_picker_loading: bool,
     skill_picker_error: Option<SharedString>,
     skill_picker_cache_key: Option<String>,
+    skill_picker_loaded_generation: Option<u64>,
+    skill_picker_request: u64,
     terminal_tool: Option<Arc<CommandTool>>,
     approver: Arc<dyn ToolApprover>,
     changes: WorkspaceChangesState,
@@ -615,6 +617,8 @@ impl Workspace {
             skill_picker_loading: false,
             skill_picker_error: None,
             skill_picker_cache_key: None,
+            skill_picker_loaded_generation: None,
+            skill_picker_request: 0,
             terminal_tool,
             approver,
             changes: WorkspaceChangesState::NotRepository,
@@ -1066,6 +1070,13 @@ impl Workspace {
         )
     }
 
+    fn should_refresh_skill_picker(
+        open_generation: Option<u64>,
+        loaded_generation: Option<u64>,
+    ) -> bool {
+        open_generation.is_some_and(|generation| loaded_generation != Some(generation))
+    }
+
     fn load_skill_picker(&mut self, cx: &mut Context<Self>) {
         let cache_key = self.skill_picker_cache_key();
         if self.skill_picker_cache_key.as_deref() == Some(cache_key.as_str()) {
@@ -1075,10 +1086,18 @@ impl Workspace {
         self.skill_picker_cache_key = Some(cache_key.clone());
         self.skill_picker = SkillPickerState::default();
         self.skill_picker_error = None;
+        self.skill_picker_loaded_generation = None;
+        self.refresh_skill_picker_catalog(cx);
+        self.sync_skill_picker(cx);
+        cx.notify();
+    }
+
+    fn refresh_skill_picker_catalog(&mut self, cx: &mut Context<Self>) {
+        self.skill_picker_request += 1;
+        let request = self.skill_picker_request;
+        let cache_key = self.skill_picker_cache_key.clone().unwrap_or_default();
         let Some(skill_tool) = self.skill_tool.clone() else {
             self.skill_picker_loading = false;
-            self.sync_skill_picker(cx);
-            cx.notify();
             return;
         };
 
@@ -1097,6 +1116,9 @@ impl Workspace {
             cx.update(|cx| {
                 workspace_handle.update(cx, |workspace, cx| {
                     if workspace.skill_picker_cache_key.as_deref() != Some(cache_key.as_str()) {
+                        return;
+                    }
+                    if workspace.skill_picker_request != request {
                         return;
                     }
                     workspace.skill_picker_loading = false;
@@ -1118,14 +1140,17 @@ impl Workspace {
             });
         })
         .detach();
-        self.sync_skill_picker(cx);
-        cx.notify();
     }
 
     fn sync_skill_picker(&mut self, cx: &mut Context<Self>) {
         let text = self.input.read(cx).text();
         let cursor = self.input.read(cx).cursor_offset();
         self.skill_picker.update(&text, cursor);
+        let open_generation = self.skill_picker.open_generation();
+        if Self::should_refresh_skill_picker(open_generation, self.skill_picker_loaded_generation) {
+            self.skill_picker_loaded_generation = open_generation;
+            self.refresh_skill_picker_catalog(cx);
+        }
     }
 
     fn handle_skill_picker_key(
@@ -5022,6 +5047,14 @@ mod tests {
         assert_eq!(Workspace::spaces_menu_step(Some(2), 3, 1), Some(0));
         assert_eq!(Workspace::spaces_menu_step(Some(0), 3, -1), Some(2));
         assert_eq!(Workspace::spaces_menu_step(Some(1), 3, -1), Some(0));
+    }
+
+    #[test]
+    fn skill_picker_refresh_follows_open_generations() {
+        assert!(Workspace::should_refresh_skill_picker(Some(1), None));
+        assert!(!Workspace::should_refresh_skill_picker(Some(1), Some(1)));
+        assert!(Workspace::should_refresh_skill_picker(Some(2), Some(1)));
+        assert!(!Workspace::should_refresh_skill_picker(None, Some(1)));
     }
 
     #[test]
