@@ -795,7 +795,7 @@ impl Workspace {
             skill_tool = Some(tool);
         }
 
-        let needs_filesystem = ["read_file", "list_dir", "write_file", "edit", "run_command"]
+        let needs_filesystem = ["read", "list_dir", "write", "edit", "run_command"]
             .iter()
             .any(|tool| harness.enables(tool));
         if needs_filesystem {
@@ -803,13 +803,13 @@ impl Workspace {
                 return (Arc::new(tools), skill_tool);
             };
             let filesystem = Arc::new(filesystem);
-            if harness.enables("read_file") {
+            if harness.enables("read") {
                 tools.register(Arc::new(ReadFileTool::new(filesystem.clone())));
             }
             if harness.enables("list_dir") {
                 tools.register(Arc::new(ListDirTool::new(filesystem.clone())));
             }
-            if harness.enables("write_file") {
+            if harness.enables("write") {
                 tools.register(Arc::new(WriteFileTool::new(filesystem.clone())));
             }
             if harness.enables("edit") {
@@ -4674,7 +4674,7 @@ mod tests {
         let tools = Workspace::build_tools(home.path(), root.path(), harness);
         let output = futures::executor::block_on(tools.execute(ToolInvocation {
             call_id: "test".into(),
-            name: "read_file".into(),
+            name: "read".into(),
             arguments: serde_json::json!({"path": "hello.txt"}),
         }));
 
@@ -4938,7 +4938,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("hello.txt"), "setup root").unwrap();
         let setups = HarnessSetupsConfig::parse(
-            r#"{"setups":[{"id":"research","name":"Research","system_prompt":{"include_harness_identity":true,"persona":"Read only."},"enabled_tools":["read_file"],"max_steps":4}]}"#,
+            r#"{"setups":[{"id":"research","name":"Research","system_prompt":{"include_harness_identity":true,"persona":"Read only."},"enabled_tools":["read"],"max_steps":4}]}"#,
         )
         .unwrap();
         let setup = setups.get("research").unwrap();
@@ -4949,7 +4949,7 @@ mod tests {
             .into_iter()
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["read_file"]);
+        assert_eq!(names, vec!["read"]);
     }
 
     #[test]
