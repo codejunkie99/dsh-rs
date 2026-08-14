@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::changes::{ChangeStatus, WorkspaceChanges, WorkspaceChangesState};
+use crate::changes::{
+    ChangeStatus, DiffLineKind, FileDiff, WorkspaceChanges, WorkspaceChangesState,
+};
 use crate::input::{ChatInput, InputKind};
 use crate::settings::UiSettings;
 use crate::theme::{Theme, CONTEXT_PANE_WIDTH, HEADER_HEIGHT, SIDEBAR_WIDTH, STATUS_HEIGHT};
@@ -60,6 +62,10 @@ pub struct Workspace {
     system_prompt: Option<String>,
     changes: WorkspaceChangesState,
     changes_scanning: bool,
+    selected_change: Option<(String, bool)>,
+    selected_diff: Option<FileDiff>,
+    diff_loading: bool,
+    diff_error: Option<String>,
     pending_approval: Option<ApprovalRequest>,
     cancellation: Option<TurnCancellation>,
     search_matches: Option<Vec<uuid::Uuid>>,
@@ -177,6 +183,10 @@ impl Workspace {
             system_prompt,
             changes: WorkspaceChangesState::NotRepository,
             changes_scanning: false,
+            selected_change: None,
+            selected_diff: None,
+            diff_loading: false,
+            diff_error: None,
             pending_approval: None,
             cancellation: None,
             search_matches: None,
@@ -382,10 +392,61 @@ impl Workspace {
             let state = cx
                 .background_spawn(async move { WorkspaceChanges::scan_blocking(root) })
                 .await;
+            let first_change = if let WorkspaceChangesState::Ready(changes) = &state {
+                changes.files.first().cloned()
+            } else {
+                None
+            };
             let _ = cx.update(|cx| {
                 workspace_handle.update(cx, |workspace, cx| {
                     workspace.changes = state;
                     workspace.changes_scanning = false;
+                    workspace.selected_change = None;
+                    workspace.selected_diff = None;
+                    workspace.diff_error = None;
+                    workspace.diff_loading = false;
+                    cx.notify();
+                    if let Some(file) = first_change {
+                        workspace.load_change_diff(file.path, file.staged, cx);
+                    }
+                })
+            });
+        })
+        .detach();
+    }
+
+    fn load_change_diff(&mut self, path: String, staged: bool, cx: &mut Context<Self>) {
+        if self.diff_loading {
+            return;
+        }
+        if self
+            .selected_change
+            .as_ref()
+            .is_some_and(|(current, current_staged)| *current == path && *current_staged == staged)
+            && self.selected_diff.is_some()
+        {
+            return;
+        }
+
+        self.selected_change = Some((path.clone(), staged));
+        self.selected_diff = None;
+        self.diff_error = None;
+        self.diff_loading = true;
+        let root = self.workspace_root.clone();
+        let workspace_handle = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_spawn(
+                    async move { WorkspaceChanges::diff_blocking(root, &path, staged) },
+                )
+                .await;
+            let _ = cx.update(|cx| {
+                workspace_handle.update(cx, |workspace, cx| {
+                    workspace.diff_loading = false;
+                    match result {
+                        Ok(diff) => workspace.selected_diff = Some(diff),
+                        Err(error) => workspace.diff_error = Some(error),
+                    }
                     cx.notify();
                 })
             });
@@ -945,7 +1006,7 @@ impl Workspace {
             }))
     }
 
-    fn render_changes_section(&self) -> gpui::Div {
+    fn render_changes_section(&self, cx: &mut Context<Self>) -> gpui::Div {
         let theme = Theme::dark();
         let section = div()
             .flex()
@@ -1027,6 +1088,14 @@ impl Workspace {
                             .take(10)
                             .enumerate()
                             .map(|(index, file)| {
+                                let path = file.path.clone();
+                                let click_path = path.clone();
+                                let staged = file.staged;
+                                let selected = self.selected_change.as_ref().is_some_and(
+                                    |(selected, selected_staged)| {
+                                        *selected == path && *selected_staged == staged
+                                    },
+                                );
                                 let (status_label, status_color) = match file.status {
                                     ChangeStatus::Added => ("A", theme.success),
                                     ChangeStatus::Deleted => ("D", theme.danger),
@@ -1056,6 +1125,23 @@ impl Workspace {
                                     .items_center()
                                     .justify_between()
                                     .gap_2()
+                                    .rounded_sm()
+                                    .bg(if selected {
+                                        theme.raised
+                                    } else {
+                                        theme.background
+                                    })
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |workspace, _, _, cx| {
+                                            workspace.load_change_diff(
+                                                click_path.clone(),
+                                                staged,
+                                                cx,
+                                            )
+                                        }),
+                                    )
                                     .child(
                                         div()
                                             .flex()
@@ -1112,6 +1198,113 @@ impl Workspace {
                     })
             }
         }
+    }
+
+    fn render_selected_diff_section(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = Theme::dark();
+        let section = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .pb_3()
+            .border_b_1()
+            .border_color(theme.border);
+
+        let Some((path, staged)) = &self.selected_change else {
+            return section;
+        };
+
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(path.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(if *staged { theme.warning } else { theme.faint })
+                            .child(if *staged { "staged" } else { "worktree" }),
+                    )
+                    .child(
+                        div()
+                            .id("close-diff")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .text_size(px(10.))
+                            .text_color(theme.muted)
+                            .hover(|style| style.bg(theme.raised).cursor_pointer())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _, _, cx| {
+                                    workspace.selected_change = None;
+                                    workspace.selected_diff = None;
+                                    workspace.diff_error = None;
+                                    workspace.diff_loading = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("Close"),
+                    ),
+            );
+
+        let section = section.child(header);
+        if self.diff_loading {
+            return section.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.faint)
+                    .child("Loading diff"),
+            );
+        }
+        if let Some(error) = &self.diff_error {
+            return section.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.danger)
+                    .child(error.clone()),
+            );
+        }
+
+        let Some(diff) = &self.selected_diff else {
+            return section;
+        };
+        section
+            .children(diff.lines.iter().map(|line| {
+                let color = match line.kind {
+                    DiffLineKind::Meta => theme.faint,
+                    DiffLineKind::Hunk => theme.accent,
+                    DiffLineKind::Context => theme.muted,
+                    DiffLineKind::Addition => theme.success,
+                    DiffLineKind::Deletion => theme.danger,
+                };
+                let content = if line.content.chars().count() > 120 {
+                    format!("{}...", line.content.chars().take(117).collect::<String>())
+                } else {
+                    line.content.clone()
+                };
+                div().text_size(px(10.)).text_color(color).child(content)
+            }))
+            .when(diff.truncated, |element| {
+                element.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.faint)
+                        .child("Diff truncated at 500 lines"),
+                )
+            })
     }
 
     fn render_context_pane(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
@@ -1233,7 +1426,8 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .child(self.render_changes_section())
+                    .child(self.render_changes_section(cx))
+                    .child(self.render_selected_diff_section(cx))
                     .child(
                         div()
                             .text_size(px(15.))

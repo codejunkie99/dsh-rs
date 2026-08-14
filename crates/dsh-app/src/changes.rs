@@ -6,6 +6,7 @@ use tokio::runtime::Runtime;
 
 const GIT_BIN: &str = "/usr/bin/git";
 const SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_DIFF_LINES: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeStatus {
@@ -26,6 +27,29 @@ pub struct ChangedFile {
     pub staged: bool,
     pub additions: Option<u64>,
     pub deletions: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffLineKind {
+    Meta,
+    Hunk,
+    Context,
+    Addition,
+    Deletion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    pub staged: bool,
+    pub lines: Vec<DiffLine>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -196,6 +220,58 @@ impl WorkspaceChanges {
         stats
     }
 
+    pub fn parse_diff(raw: &str) -> FileDiff {
+        let mut lines = Vec::new();
+        let mut truncated = false;
+        for line in raw.lines() {
+            if lines.len() == MAX_DIFF_LINES {
+                truncated = true;
+                break;
+            }
+            let kind = if line.starts_with("diff --git")
+                || line.starts_with("index ")
+                || line.starts_with("--- ")
+                || line.starts_with("+++ ")
+                || line.starts_with("\\ No newline")
+            {
+                DiffLineKind::Meta
+            } else if line.starts_with("@@") {
+                DiffLineKind::Hunk
+            } else if line.starts_with('+') {
+                DiffLineKind::Addition
+            } else if line.starts_with('-') {
+                DiffLineKind::Deletion
+            } else {
+                DiffLineKind::Context
+            };
+            lines.push(DiffLine {
+                kind,
+                content: line.to_string(),
+            });
+        }
+        FileDiff {
+            path: String::new(),
+            staged: false,
+            lines,
+            truncated,
+        }
+    }
+
+    fn validate_repo_path(path: &str) -> Result<&str, String> {
+        if path.is_empty() || path.contains('\0') {
+            return Err("Git diff path is empty".into());
+        }
+        let repository_path = Path::new(path);
+        if repository_path.is_absolute()
+            || repository_path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(format!("Git diff path escapes the repository: {path}"));
+        }
+        Ok(path)
+    }
+
     fn numstat_value(value: &str) -> Option<u64> {
         if value == "-" {
             None
@@ -228,6 +304,46 @@ impl WorkspaceChanges {
         runtime.block_on(Self::scan(root))
     }
 
+    pub fn diff_blocking(
+        root: impl AsRef<Path>,
+        path: &str,
+        staged: bool,
+    ) -> Result<FileDiff, String> {
+        let path = Self::validate_repo_path(path)?.to_string();
+        let runtime = Runtime::new()
+            .map_err(|error| format!("failed to construct Git diff runtime: {error}"))?;
+        let raw = runtime.block_on(Self::diff_raw(root.as_ref(), &path, staged))?;
+        let mut diff = Self::parse_diff(&raw);
+        diff.path = path;
+        diff.staged = staged;
+        Ok(diff)
+    }
+
+    async fn diff_raw(root: &Path, path: &str, staged: bool) -> Result<String, String> {
+        if staged {
+            return Self::git(root, &["diff", "--cached", "--", path]).await;
+        }
+
+        let worktree = Self::git(root, &["diff", "--", path]).await?;
+        if !worktree.trim().is_empty() {
+            return Ok(worktree);
+        }
+
+        let tracked = Self::git(root, &["ls-files", "--error-unmatch", "--", path]).await;
+        if tracked.is_ok_and(|files| !files.trim().is_empty()) {
+            return Ok(worktree);
+        }
+
+        let absolute = root.join(path);
+        let absolute = absolute.to_string_lossy().into_owned();
+        Self::git_with_success_codes(
+            root,
+            &["diff", "--no-index", "--", "/dev/null", &absolute],
+            &[0, 1],
+        )
+        .await
+    }
+
     async fn scan_repository(root: &Path) -> WorkspaceChangesState {
         let commands: [(&str, &[&str]); 3] = [
             (
@@ -255,6 +371,14 @@ impl WorkspaceChanges {
     }
 
     async fn git(root: &Path, args: &[&str]) -> Result<String, String> {
+        Self::git_with_success_codes(root, args, &[0]).await
+    }
+
+    async fn git_with_success_codes(
+        root: &Path,
+        args: &[&str],
+        success_codes: &[i32],
+    ) -> Result<String, String> {
         let mut command = Command::new(GIT_BIN);
         command
             .arg("--no-optional-locks")
@@ -273,7 +397,8 @@ impl WorkspaceChanges {
             .await
             .map_err(|_| format!("git {} timed out", args[0]))?
             .map_err(|error| format!("git {} failed: {error}", args[0]))?;
-        if output.status.success() {
+        let status_code = output.status.code().unwrap_or(-1);
+        if success_codes.contains(&status_code) {
             String::from_utf8(output.stdout)
                 .map_err(|_| format!("git {} returned invalid UTF-8", args[0]))
         } else {
@@ -362,6 +487,49 @@ mod tests {
         assert!(changes.files.is_empty());
     }
 
+    #[test]
+    fn parses_unified_diff_lines() {
+        let raw = "\
+            diff --git a/example.rs b/example.rs\n\
+            index 1234567..89abcde 100644\n\
+            --- a/example.rs\n\
+            +++ b/example.rs\n\
+            @@ -1,3 +1,4 @@\n\
+             context\n\
+            -old\n\
+            +new\n\
+            \\ No newline at end of file\n";
+
+        let diff = WorkspaceChanges::parse_diff(raw);
+
+        assert_eq!(diff.lines.len(), 9);
+        assert_eq!(diff.lines[0].kind, DiffLineKind::Meta);
+        assert_eq!(diff.lines[4].kind, DiffLineKind::Hunk);
+        assert_eq!(diff.lines[5].kind, DiffLineKind::Context);
+        assert_eq!(diff.lines[6].kind, DiffLineKind::Deletion);
+        assert_eq!(diff.lines[7].kind, DiffLineKind::Addition);
+        assert_eq!(diff.lines[8].kind, DiffLineKind::Meta);
+        assert!(!diff.truncated);
+    }
+
+    #[test]
+    fn bounds_large_diff_rendering() {
+        let raw: String = (0..501).map(|index| format!("+line-{index}\n")).collect();
+
+        let diff = WorkspaceChanges::parse_diff(&raw);
+
+        assert_eq!(diff.lines.len(), 500);
+        assert!(diff.truncated);
+    }
+
+    #[test]
+    fn diff_paths_cannot_escape_the_repository() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(WorkspaceChanges::diff_blocking(root.path(), "", false).is_err());
+        assert!(WorkspaceChanges::diff_blocking(root.path(), "/absolute", false).is_err());
+        assert!(WorkspaceChanges::diff_blocking(root.path(), "../escape", false).is_err());
+    }
+
     #[tokio::test]
     async fn scans_a_real_repository_without_modifying_it() {
         let root = tempfile::tempdir().unwrap();
@@ -395,6 +563,40 @@ mod tests {
             .files
             .iter()
             .any(|file| file.path == "untracked.txt" && file.status == ChangeStatus::Untracked));
+    }
+
+    #[test]
+    fn reads_real_staged_worktree_and_untracked_diffs() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "--initial-branch=main"]);
+        git(root.path(), &["config", "user.email", "test@example.com"]);
+        git(root.path(), &["config", "user.name", "DSH Test"]);
+        std::fs::write(root.path().join("tracked.txt"), "one\n").unwrap();
+        git(root.path(), &["add", "tracked.txt"]);
+        git(root.path(), &["commit", "-m", "initial"]);
+
+        std::fs::write(root.path().join("tracked.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(root.path().join("staged.txt"), "staged\n").unwrap();
+        std::fs::write(root.path().join("untracked.txt"), "untracked\n").unwrap();
+        git(root.path(), &["add", "staged.txt"]);
+
+        let staged = WorkspaceChanges::diff_blocking(root.path(), "staged.txt", true).unwrap();
+        let worktree = WorkspaceChanges::diff_blocking(root.path(), "tracked.txt", false).unwrap();
+        let untracked =
+            WorkspaceChanges::diff_blocking(root.path(), "untracked.txt", false).unwrap();
+
+        assert!(staged
+            .lines
+            .iter()
+            .any(|line| line.kind == DiffLineKind::Addition && line.content.contains("staged")));
+        assert!(worktree
+            .lines
+            .iter()
+            .any(|line| line.kind == DiffLineKind::Addition && line.content.contains("two")));
+        assert!(untracked
+            .lines
+            .iter()
+            .any(|line| line.kind == DiffLineKind::Addition && line.content.contains("untracked")));
     }
 
     #[tokio::test]
