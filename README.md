@@ -6,7 +6,7 @@ A native Rust + GPUI desktop milestone for the DeepSeek Harness agent model. It 
 
 - GPU-accelerated native macOS interface built with GPUI 0.2.2.
 - Comet-inspired three-pane developer workbench: a 256 px spaces/sessions rail, center transcript and composer, and a persisted 420 px context pane.
-- Read-only Git changes scanning for the scoped workspace with branch, tracking, staged/worktree, and line-total summaries.
+- Read-only Git changes scanning for the scoped workspace with branch, tracking, staged/worktree, line totals, and clickable per-file diffs.
 - Append-only, replayable JSONL session logs.
 - Automatic bounded session titles from the first user message.
 - Session sidebar with model, event count, and active-turn state.
@@ -67,11 +67,11 @@ The native shell uses a dense dark three-pane layout adapted from the MIT-licens
 - Left rail: spaces, session search, sessions, and model access.
 - Center pane: session header, transcript, tool approvals, composer, and reserved status strip.
 - Right pane: selected-session model/event/turn/prompt state plus recent tool activity.
-- Git changes: branch and ahead/behind state, bounded changed-file rows, staged/worktree labels, and `git diff --numstat` line totals.
+- Git changes: branch and ahead/behind state, bounded changed-file rows, staged/worktree labels, `git diff --numstat` line totals, and clickable unified diffs.
 
 Pane visibility persists in `~/.dsh-rs/ui.json`. Press `Cmd+S` to toggle the left rail and `Cmd+B` to toggle the context pane.
 
-The Git scanner is UI-only and read-only. It invokes `/usr/bin/git` directly with an empty environment, disables optional locks, fsmonitor, paging, and terminal prompts, and applies a five-second timeout. Git data is not exposed to model tools by this scanner.
+The Git scanner is UI-only and read-only. It invokes `/usr/bin/git` directly with an empty environment, disables optional locks, fsmonitor, paging, and terminal prompts, and applies a five-second timeout. File paths are rejected if they are absolute or traverse outside the repository. Diff rendering is capped at 500 lines and long lines are truncated. Git data is not exposed to model tools by this scanner.
 
 ## System prompt
 
