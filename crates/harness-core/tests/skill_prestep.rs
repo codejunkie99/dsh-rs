@@ -2,9 +2,12 @@ use harness_core::agent::AgentLoop;
 use harness_core::events::EventKind;
 use harness_core::llm::{LlmAdapter, LlmRequest, StreamFrame};
 use harness_core::session::SessionLog;
-use harness_core::skills::{SkillInvocationPolicy, SkillRegistry};
+use harness_core::skills::{
+    FileSystemSkillProvider, SkillFileSystemConfig, SkillInvocationPolicy, SkillRegistry,
+};
 use harness_core::tools::skill::{
-    render_skill_catalog, SkillCatalogEntry, SkillSlashEntry, SkillTool,
+    render_skill_catalog, render_skill_catalog_update, SkillCatalogEntry, SkillSlashEntry,
+    SkillTool,
 };
 use harness_core::tools::ToolRegistry;
 use std::sync::Arc;
@@ -102,6 +105,47 @@ async fn slash_entries_include_user_invocable_skills_and_mark_model_visibility()
                 model_invocable: false,
             },
         ]
+    );
+}
+
+#[test]
+fn skill_catalog_updates_render_the_exact_dsh_contract() {
+    let replacement = render_skill_catalog_update(&[SkillCatalogEntry {
+        name: "replacement".into(),
+        description: "Replacement & guide".into(),
+    }]);
+    assert_eq!(
+        replacement,
+        [
+            "<system-reminder>",
+            "The available skill catalog changed. This complete catalog replaces every earlier available-skills list in this session:",
+            "",
+            "<available_skills>",
+            "- `replacement`: Replacement &amp; guide",
+            "</available_skills>",
+            "",
+            "Use only names in this replacement catalog. If the user names a listed skill, or the task clearly matches its description, call the `skill` tool with the exact skill name before acting.",
+            "A user may also invoke a skill directly; its <skill_content> block then appears in this conversation. Follow it, and do not call the `skill` tool again for that skill.",
+            "</system-reminder>",
+        ]
+        .join("\n")
+    );
+
+    let tombstone = render_skill_catalog_update(&[]);
+    assert_eq!(
+        tombstone,
+        [
+            "<system-reminder>",
+            "The available skill catalog changed. This complete catalog replaces every earlier available-skills list in this session:",
+            "",
+            "<available_skills>",
+            "</available_skills>",
+            "",
+            "No skills are currently available through the `skill` tool. Do not use names from earlier skill catalogs.",
+            "A user may still invoke a skill directly; its <skill_content> block then appears in this conversation. Follow it, and do not call the `skill` tool for it.",
+            "</system-reminder>",
+        ]
+        .join("\n")
     );
 }
 
@@ -220,6 +264,178 @@ async fn agent_publishes_catalog_once_and_injects_user_invocable_skills() {
     assert!(user_contents(&requests[1])
         .join("\n")
         .contains("<skill_content name=\"a-skill\">"));
+}
+
+#[tokio::test]
+async fn agent_replaces_changed_catalogs_and_publishes_an_empty_tombstone() {
+    let home = tempfile::tempdir().unwrap();
+    let skills = home.path().join(".dsh/skills");
+    std::fs::create_dir_all(skills.join("first-skill")).unwrap();
+    std::fs::write(
+        skills.join("first-skill/SKILL.md"),
+        "---\nname: first-skill\ndescription: First skill\n---\n\nFirst body.\n",
+    )
+    .unwrap();
+
+    let mut registry = SkillRegistry::new();
+    let provider = FileSystemSkillProvider::new(SkillFileSystemConfig {
+        include_default_roots: true,
+        dsh_home: home.path().join(".dsh"),
+        agents_home: home.path().join(".agents"),
+        custom_skill_dirs: Vec::new(),
+        bundled_skill_dir: None,
+    })
+    .unwrap();
+    registry.register_provider(Arc::new(provider)).unwrap();
+    let skill_tool = Arc::new(SkillTool::new(Arc::new(registry)));
+    let mut tools = ToolRegistry::new();
+    tools.register(skill_tool.clone());
+    let adapter = Arc::new(RecordingAdapter {
+        requests: std::sync::Mutex::new(Vec::new()),
+    });
+    let adapter_handle = adapter.clone();
+    let agent = AgentLoop::new(adapter, Arc::new(tools))
+        .with_skill_tool(skill_tool)
+        .with_max_steps(1);
+    let log = Arc::new(SessionLog::in_memory(Uuid::new_v4()));
+
+    agent
+        .run_turn(log.clone(), "first turn".into())
+        .await
+        .unwrap();
+    let catalogs = published_catalogs(&log);
+    assert_eq!(catalogs.len(), 1);
+    assert_eq!(
+        catalogs[0],
+        SkillCatalogPublished {
+            update: false,
+            entries: vec![SkillCatalogEntry {
+                name: "first-skill".into(),
+                description: "First skill".into(),
+            }],
+            content: render_skill_catalog(&[SkillCatalogEntry {
+                name: "first-skill".into(),
+                description: "First skill".into(),
+            }]),
+        }
+    );
+
+    std::fs::create_dir_all(skills.join("second-skill")).unwrap();
+    std::fs::write(
+        skills.join("second-skill/SKILL.md"),
+        "---\nname: second-skill\ndescription: Second skill\n---\n\nSecond body.\n",
+    )
+    .unwrap();
+    agent
+        .run_turn(log.clone(), "second turn".into())
+        .await
+        .unwrap();
+    let catalogs = published_catalogs(&log);
+    assert_eq!(catalogs.len(), 2);
+    assert_eq!(
+        catalogs[1],
+        SkillCatalogPublished {
+            update: true,
+            entries: vec![
+                SkillCatalogEntry {
+                    name: "first-skill".into(),
+                    description: "First skill".into(),
+                },
+                SkillCatalogEntry {
+                    name: "second-skill".into(),
+                    description: "Second skill".into(),
+                }
+            ],
+            content: render_skill_catalog_update(&[
+                SkillCatalogEntry {
+                    name: "first-skill".into(),
+                    description: "First skill".into(),
+                },
+                SkillCatalogEntry {
+                    name: "second-skill".into(),
+                    description: "Second skill".into(),
+                }
+            ]),
+        }
+    );
+    let requests = adapter_handle.requests.lock().unwrap().clone();
+    let model_catalogs = user_contents(&requests[1])
+        .into_iter()
+        .filter(|content| {
+            content.contains("A skill is a reusable")
+                || content.contains("The available skill catalog changed")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(model_catalogs.len(), 1);
+    assert!(model_catalogs[0].contains("The available skill catalog changed"));
+    assert!(!model_catalogs[0].contains("A skill is a reusable"));
+
+    std::fs::remove_dir_all(skills.join("first-skill")).unwrap();
+    std::fs::remove_dir_all(skills.join("second-skill")).unwrap();
+    agent
+        .run_turn(log.clone(), "third turn".into())
+        .await
+        .unwrap();
+    let catalogs = published_catalogs(&log);
+    assert_eq!(catalogs.len(), 3);
+    assert_eq!(
+        catalogs[2],
+        SkillCatalogPublished {
+            update: true,
+            entries: Vec::new(),
+            content: render_skill_catalog_update(&[]),
+        }
+    );
+    assert!(catalogs[2]
+        .content
+        .contains("No skills are currently available"));
+    assert!(!catalogs[2].content.contains("first-skill"));
+    assert!(!catalogs[2].content.contains("second-skill"));
+    let requests = adapter_handle.requests.lock().unwrap().clone();
+    let model_catalogs = user_contents(&requests[2])
+        .into_iter()
+        .filter(|content| {
+            content.contains("A skill is a reusable")
+                || content.contains("The available skill catalog changed")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(model_catalogs.len(), 1);
+    assert!(model_catalogs[0].contains("No skills are currently available"));
+
+    agent
+        .run_turn(log.clone(), "fourth turn".into())
+        .await
+        .unwrap();
+    assert_eq!(published_catalogs(&log).len(), 3);
+}
+
+fn published_catalogs(log: &Arc<SessionLog>) -> Vec<SkillCatalogPublished> {
+    log.events()
+        .iter()
+        .filter_map(|event| {
+            if let EventKind::SkillCatalogPublished {
+                entries,
+                content,
+                update,
+            } = &event.kind
+            {
+                Some(SkillCatalogPublished {
+                    entries: entries.clone(),
+                    content: content.clone(),
+                    update: *update,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillCatalogPublished {
+    entries: Vec<SkillCatalogEntry>,
+    content: String,
+    update: bool,
 }
 
 #[tokio::test]
