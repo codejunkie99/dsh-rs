@@ -194,6 +194,44 @@ impl ScopedFs {
     }
 }
 
+const DEFAULT_READ_LIMIT: usize = 2_000;
+const MAX_READ_LINE_LENGTH: usize = 2_000;
+const MAX_READ_OUTPUT_BYTES: usize = 50 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadToolArguments {
+    file_path: String,
+    #[serde(default = "default_read_offset")]
+    offset: usize,
+    #[serde(default = "default_read_limit")]
+    limit: usize,
+}
+
+fn default_read_offset() -> usize { 1 }
+fn default_read_limit() -> usize { DEFAULT_READ_LIMIT }
+
+fn format_read_output(path: &str, offset: usize, lines: &[(usize, String)], total_lines: usize, truncated_by_bytes: bool) -> String {
+    let end_line = lines.last().map(|(number, _)| *number).unwrap_or(offset.saturating_sub(1));
+    let footer = if truncated_by_bytes {
+        format!("(Output capped. Showing lines {offset}-{end_line}. Use offset={} to continue.)", end_line + 1)
+    } else if end_line < total_lines {
+        format!("(Showing lines {offset}-{end_line} of {total_lines}. Use offset={} to continue.)", end_line + 1)
+    } else {
+        format!("(End of file - total {total_lines} lines)")
+    };
+    let body = if lines.is_empty() {
+        footer
+    } else {
+        let numbered = lines.iter()
+            .map(|(number, text)| format!("{number}: {text}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{numbered}\n\n{footer}")
+    };
+    format!("<path>{path}</path>\n<type>file</type>\n<content>\n{body}\n</content>")
+}
+
 pub struct ReadFileTool {
     fs: Arc<ScopedFs>,
 }
@@ -208,23 +246,99 @@ impl ReadFileTool {
 impl Tool for ReadFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "read_file".into(),
-            description: "Read a UTF-8 text file from the scoped workspace.".into(),
+            name: "read".into(),
+            description: "Read a UTF-8 text file and return line-numbered content.".into(),
             parameters: serde_json::json!({
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative path"}
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to read, resolved by the filesystem backend."
+                    },
+                    "offset": {
+                        "type": "number",
+                        "description": "1-based first line to return. Defaults to 1."
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of lines to return. Defaults to 2000."
+                    }
                 },
-                "required": ["path"]
+                "required": ["file_path"]
             }),
         }
     }
 
+    fn present_call(&self, arguments: &serde_json::Value) -> Option<ToolCallView> {
+        let path = arguments.get("file_path").and_then(|value| value.as_str()).unwrap_or_default();
+        Some(ToolCallView::Generic {
+            title: format!("Read {path}"),
+            kind: Some(ToolCallKind::Read),
+            raw_input: None,
+        })
+    }
+
     async fn execute(&self, invocation: ToolInvocation) -> Result<ToolOutput> {
-        let path = required_string(&invocation.arguments, "path")?;
+        let arguments: ReadToolArguments = serde_json::from_value(invocation.arguments)?;
+        if arguments.file_path.trim().is_empty() {
+            bail!("file_path must be a non-empty string");
+        }
+        if arguments.offset == 0 {
+            bail!("offset must be a positive integer");
+        }
+        if arguments.limit == 0 {
+            bail!("limit must be a positive integer");
+        }
+        if arguments.limit > DEFAULT_READ_LIMIT {
+            bail!("limit must be less than or equal to {DEFAULT_READ_LIMIT}");
+        }
+
+        let raw = self.fs.read_text(&arguments.file_path)?;
+        let all_lines: Vec<String> = if raw.is_empty() {
+            Vec::new()
+        } else {
+            raw.split_terminator('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+                .collect()
+        };
+        let total_lines = all_lines.len();
+        if arguments.offset > total_lines && !(total_lines == 0 && arguments.offset == 1) {
+            bail!(
+                "offset {} is out of range for \"{}\" ({} lines)",
+                arguments.offset,
+                arguments.file_path,
+                total_lines
+            );
+        }
+
+        let mut lines = Vec::new();
+        let mut output_bytes = 0usize;
+        let mut truncated_by_bytes = false;
+        for (index, raw_line) in all_lines.iter().enumerate().skip(arguments.offset.saturating_sub(1)).take(arguments.limit) {
+            let mut line = raw_line.clone();
+            if line.chars().count() > MAX_READ_LINE_LENGTH {
+                line = line.chars().take(MAX_READ_LINE_LENGTH).collect::<String>()
+                    + &format!("... (line truncated to {MAX_READ_LINE_LENGTH} chars)");
+            }
+            let bytes = line.as_bytes().len() + usize::from(!lines.is_empty());
+            if output_bytes + bytes > MAX_READ_OUTPUT_BYTES {
+                truncated_by_bytes = true;
+                break;
+            }
+            output_bytes += bytes;
+            lines.push((index + 1, line));
+        }
+
         Ok(ToolOutput {
             ok: true,
-            output: self.fs.read_text(&path)?,
+            output: format_read_output(
+                &arguments.file_path,
+                arguments.offset,
+                &lines,
+                total_lines,
+                truncated_by_bytes,
+            ),
         })
     }
 }
@@ -243,26 +357,47 @@ impl WriteFileTool {
 impl Tool for WriteFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "write_file".into(),
-            description: "Atomically write a UTF-8 text file inside the scoped workspace.".into(),
+            name: "write".into(),
+            description: "Create or fully replace a UTF-8 text file.".into(),
             parameters: serde_json::json!({
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative path"},
-                    "content": {"type": "string", "description": "Full file contents"}
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to write, resolved by the filesystem backend."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full UTF-8 text content to write."
+                    }
                 },
-                "required": ["path", "content"]
+                "required": ["file_path", "content"]
             }),
         }
     }
 
+    fn present_call(&self, arguments: &serde_json::Value) -> Option<ToolCallView> {
+        let path = arguments.get("file_path").and_then(|value| value.as_str()).unwrap_or_default();
+        Some(ToolCallView::Generic {
+            title: format!("Write {path}"),
+            kind: Some(ToolCallKind::Edit),
+            raw_input: None,
+        })
+    }
+
     async fn execute(&self, invocation: ToolInvocation) -> Result<ToolOutput> {
-        let path = required_string(&invocation.arguments, "path")?;
+        let file_path = required_string(&invocation.arguments, "file_path")?;
+        if file_path.trim().is_empty() {
+            bail!("file_path must be a non-empty string");
+        }
         let content = required_string(&invocation.arguments, "content")?;
-        self.fs.write_text(&path, &content)?;
+        let existed = self.fs.root().join(&file_path).exists();
+        self.fs.write_text(&file_path, &content)?;
+        let operation = if existed { "Updated" } else { "Created" };
         Ok(ToolOutput {
             ok: true,
-            output: format!("Wrote {path} ({} bytes).", content.len()),
+            output: format!("<path>{file_path}</path>\n<type>file</type>\n<content>\n{operation} file\n</content>"),
         })
     }
 }
