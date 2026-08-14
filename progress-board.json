@@ -1,0 +1,324 @@
+{
+  "version": 1,
+  "project": "DeepSeek Harness Rust rewrite",
+  "updated_at": "2026-08-14T20:39:27Z",
+  "estimate_note": "Remaining percentages are conservative engineering estimates, not test-derived completion proofs. Ranges are intentionally conservative.",
+  "workstreams": [
+    {
+      "id": "skills",
+      "label": "Skill subsystem",
+      "remaining": [
+        2,
+        4
+      ],
+      "baseline_remaining": [
+        50,
+        50
+      ],
+      "confidence": "medium",
+      "status": "in progress",
+      "shipped": [
+        "Scoped provider registration and RAII disposal",
+        "Filesystem watcher invalidation and registry observer events",
+        "Scoped layers, chain-aware cache keys, and preset rebind seam",
+        "Event-driven slash-menu snapshot refresh",
+        "Shared cancellation flag between provider control and registration",
+        "Exact-provider-identity stale-definition invalidation",
+        "First-wins runtime duplicate registration",
+        "End-to-end standing-preset slash-catalog regression",
+        "Insertion-ordered FIFO collect-cache eviction (IndexMap)",
+        "Silent no-op SkillProviderControl::invalidate after disposal",
+        "Ancestor-aware filesystem watcher/polling fingerprints"
+      ],
+      "next": [
+        "Audit any residual observer/cache, provider lifecycle, and watcher edge cases",
+        "Verify scoped registration/recomposition/slash-refresh remain parity-clean"
+      ],
+      "evidence": [
+        "crates/harness-core/src/skills.rs",
+        "crates/harness-core/src/tools/skill.rs",
+        "crates/harness-core/tests/skill_subsystem.rs"
+      ],
+      "estimate_source": "runner PROGRESS_JSON"
+    },
+    {
+      "id": "tools",
+      "label": "DSH tool/catalog parity",
+      "remaining": [
+        52,
+        60
+      ],
+      "baseline_remaining": [
+        70,
+        75
+      ],
+      "confidence": "low",
+      "status": "in progress",
+      "shipped": [
+        "Skill tool catalog, invocation, visibility, and scoped execution contract",
+        "Filesystem and shell policy foundations already present",
+        "edit literal-replacement tool (EditFileTool): unique-match/replace_all, CRLF restore, upstream result strings",
+        "Canonical read/write tool schemas and registry/app dispatch",
+        "Read offset/limit windows with line numbering and bounded output",
+        "Scoped glob and grep catalog tools with registry regressions"
+      ],
+      "next": [
+        "Complete write/read sandbox escalation and structured result metadata",
+        "Port remaining search caps/regex semantics and bash shell semantics",
+        "Cover browser, editor, external integrations, approvals, and execution lifecycle"
+      ],
+      "evidence": [
+        "crates/harness-core/src/tools/fs.rs",
+        "crates/harness-core/src/tools/search.rs",
+        "crates/harness-core/tests/tool_fs.rs",
+        "crates/harness-core/tests/tool_search.rs",
+        "crates/dsh-app/src/workspace.rs",
+        "docs/parity/tool-audit.md"
+      ],
+      "estimate_source": "runner PROGRESS_JSON"
+    },
+    {
+      "id": "agent",
+      "label": "Agent/session parity",
+      "remaining": [
+        38,
+        46
+      ],
+      "baseline_remaining": [
+        50,
+        55
+      ],
+      "confidence": "medium",
+      "status": "in progress",
+      "shipped": [
+        "Session-owned SkillScope",
+        "AgentLoop-to-SkillTool scoped catalog and invocation path",
+        "End-to-end preset recomposition test"
+      ],
+      "next": [
+        "Assign scopes during real app session creation and reopen",
+        "Match pre-step ordering and context compaction",
+        "Cover fork, import/export, replay, and provider routing edge cases"
+      ],
+      "evidence": [
+        "crates/harness-core/src/session.rs",
+        "crates/harness-core/src/agent.rs",
+        "crates/harness-core/tests/skill_prestep.rs"
+      ],
+      "estimate_source": "runner PROGRESS_JSON"
+    },
+    {
+      "id": "ui",
+      "label": "Comet/UI exact parity",
+      "remaining": [
+        60,
+        70
+      ],
+      "baseline_remaining": [
+        60,
+        70
+      ],
+      "confidence": "low",
+      "status": "in progress",
+      "shipped": [
+        "Native GPUI primitives, theme, motion, picker, and workbench foundations"
+      ],
+      "next": [
+        "Rendered screen-by-screen QA",
+        "Motion, typography, glass, settings, picker, and terminal fidelity",
+        "Design missing DSH surfaces in the Comet visual language"
+      ],
+      "evidence": [
+        "crates/dsh-app/src/",
+        "docs/parity/"
+      ],
+      "estimate_source": "runner PROGRESS_JSON"
+    },
+    {
+      "id": "provider",
+      "label": "Provider/auth/logo surface",
+      "remaining": [
+        50,
+        50
+      ],
+      "baseline_remaining": [
+        50,
+        50
+      ],
+      "confidence": "low",
+      "status": "in progress",
+      "shipped": [
+        "Provider branding and auth foundation"
+      ],
+      "next": [
+        "DeepSeek Harness logo-based provider model",
+        "Credential lifecycle, routing, validation, retry, and disconnected states"
+      ],
+      "evidence": [
+        "crates/dsh-app/src/settings/providers.rs",
+        "crates/harness-core/src/remote.rs"
+      ],
+      "estimate_source": "runner PROGRESS_JSON"
+    },
+    {
+      "id": "production",
+      "label": "Production readiness",
+      "remaining": [
+        60,
+        65
+      ],
+      "baseline_remaining": [
+        60,
+        65
+      ],
+      "confidence": "low",
+      "status": "not started",
+      "shipped": [],
+      "next": [
+        "Signing, notarization, installer, update, and release-channel hardening",
+        "Crash reporting, diagnostics, profiling, and large-session stress tests",
+        "Accessibility, keyboard navigation, and full end-to-end user-path QA"
+      ],
+      "evidence": [],
+      "estimate_source": "runner PROGRESS_JSON"
+    }
+  ],
+  "milestones": [
+    {
+      "id": "alpha",
+      "label": "Useful native GPUI alpha",
+      "remaining": [
+        27,
+        37
+      ],
+      "baseline_remaining": [
+        35,
+        45
+      ],
+      "confidence": "low",
+      "status": "in progress",
+      "next": [
+        "Finish real session/preset wiring and close the main chat/session path"
+      ],
+      "estimate_source": "runner PROGRESS_JSON"
+    },
+    {
+      "id": "parity",
+      "label": "Full DSH functional parity",
+      "remaining": [
+        65,
+        70
+      ],
+      "baseline_remaining": [
+        70,
+        75
+      ],
+      "confidence": "low",
+      "status": "in progress",
+      "next": [
+        "Complete tool inventory, session semantics, provider routing, and user-path QA"
+      ],
+      "estimate_source": "runner PROGRESS_JSON"
+    },
+    {
+      "id": "release",
+      "label": "Exact UI/UX plus production release quality",
+      "remaining": [
+        65,
+        70
+      ],
+      "baseline_remaining": [
+        70,
+        75
+      ],
+      "confidence": "low",
+      "status": "in progress",
+      "next": [
+        "Rendered acceptance, accessibility, packaging, signing, diagnostics, and release gates"
+      ],
+      "estimate_source": "runner PROGRESS_JSON"
+    }
+  ],
+  "loop": {
+    "cycle": 2,
+    "status": "in progress",
+    "last_summary": "Shipped canonical read/write contracts plus bounded glob/grep search tools; CI is currently failing without exposed job logs and remains a verification gate.",
+    "last_run": "/Users/arnavdas/Documents/Codex/2026-08-09/i-have-an-idea-can-we/loop/cycles/cycle-01-run.md",
+    "estimate_parse_error": null,
+    "last_log": "/Volumes/PortableSSD/dsh-rs/log.md"
+  },
+  "activity": [
+    {
+      "cycle": 8,
+      "status": "done",
+      "summary": "Status: Closed provider-lifecycle and cache-event parity gaps: shared cancellation flag between SkillProviderControl and SkillProviderRegistration, exact-provider-identity stale-definition invalidation (Arc::ptr_eq), and first-wins runtime duplicate registration. Added an end-to-",
+      "recorded_at": "2026-08-14T18:15:28Z"
+    },
+    {
+      "cycle": 2,
+      "status": "max-cycles",
+      "summary": "Completed a focused, tested slice on the named watcher target. Three upstream-backed parity corrections landed in the skill registry, plus an end-to-end regression.",
+      "recorded_at": "2026-08-14T18:20:12Z"
+    },
+    {
+      "cycle": 3,
+      "status": "max-cycles",
+      "summary": "The named watcher target is closed with focused regressions. Here's what shipped and where the rewrite stands.",
+      "recorded_at": "2026-08-14T18:35:23Z"
+    },
+    {
+      "cycle": 10,
+      "status": "done",
+      "summary": "Status: Closed the skill config-surface gap and landed the first tool-parity contract correction. Shipped SkillTool catalogDescriptionMaxLength (default 500, min 3) matching upstream tool-skill Config, and fixed todo_write to render upstream's human-readable counts line instead o",
+      "recorded_at": "2026-08-14T18:43:16Z"
+    },
+    {
+      "cycle": 4,
+      "status": "max-cycles",
+      "summary": "Two bounded slices landed this cycle, both evidence-backed and tested.",
+      "recorded_at": "2026-08-14T18:46:31Z"
+    },
+    {
+      "cycle": 5,
+      "status": "done",
+      "summary": "Status: Closed the three named skill contracts (presentCall, observeHostMutation behind fs/observed, abort-observable control), the residual lookup-signal abort race, and shipped scoped/agent-aware ToolRegistry registration with exact-identity get(name, scope) replacing the skill",
+      "recorded_at": "2026-08-14T19:22:39Z"
+    },
+    {
+      "cycle": 5,
+      "status": "max-cycles",
+      "summary": "Shipped this cycle, all evidence-backed and tested.",
+      "recorded_at": "2026-08-14T19:25:41Z"
+    },
+    {
+      "cycle": 6,
+      "status": "done",
+      "summary": "Shipped: closed the packages/skill/* audit gate with evidence, fixed the abort and provider-order mismatches, and added a full-chain end-to-end regression.",
+      "recorded_at": "2026-08-14T19:42:41Z"
+    },
+    {
+      "cycle": 6,
+      "status": "max-cycles",
+      "summary": "Closed the skill audit gate with explicit evidence this cycle.",
+      "recorded_at": "2026-08-14T19:46:05Z"
+    },
+    {
+      "cycle": 7,
+      "status": "in progress",
+      "summary": "Status: Implemented the upstream `edit` tool (EditFileTool) through the real ToolRegistry dispatch path: literal unique-match/replace_all edit, CRLF normalize + line-ending restore, and upstream not-found/ambiguous/validation/result strings. Registered it in SUPPORTED_TOOLS (7→8)",
+      "recorded_at": "2026-08-14T19:55:19Z"
+    },
+    {
+      "cycle": 1,
+      "status": "max-cycles",
+      "summary": "Shipped one bounded, evidence-backed slice on DSH tool parity this cycle.",
+      "recorded_at": "2026-08-14T19:59:15Z"
+    },
+    {
+      "cycle": 2,
+      "status": "in progress",
+      "summary": "Shipped canonical read/write contracts, read windows, and scoped glob/grep registry dispatch with focused regressions. CI verification is still failing and requires correction.",
+      "recorded_at": "2026-08-14T20:39:27Z"
+    }
+  ]
+}

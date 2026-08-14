@@ -4,6 +4,7 @@ use harness_core::llm::{LlmAdapter, LlmRequest, StreamFrame};
 use harness_core::session::SessionLog;
 use harness_core::skills::{
     FileSystemSkillProvider, SkillFileSystemConfig, SkillInvocationPolicy, SkillRegistry,
+    SkillScope, SkillViewOptions, SkillWatchConfig,
 };
 use harness_core::tools::skill::{
     render_skill_catalog, render_skill_catalog_update, SkillCatalogEntry, SkillSlashEntry,
@@ -14,7 +15,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 fn skill_registry() -> Arc<SkillRegistry> {
-    let mut registry = SkillRegistry::new();
+    let registry = SkillRegistry::new();
     registry
         .register_runtime(
             "a-skill",
@@ -277,16 +278,26 @@ async fn agent_replaces_changed_catalogs_and_publishes_an_empty_tombstone() {
     )
     .unwrap();
 
-    let mut registry = SkillRegistry::new();
-    let provider = FileSystemSkillProvider::new(SkillFileSystemConfig {
-        include_default_roots: true,
-        dsh_home: home.path().join(".dsh"),
-        agents_home: home.path().join(".agents"),
-        custom_skill_dirs: Vec::new(),
-        bundled_skill_dir: None,
-    })
-    .unwrap();
-    registry.register_provider(Arc::new(provider)).unwrap();
+    let registry = SkillRegistry::new();
+    let _registration = registry
+        .register_provider_scoped_with_control(|control| {
+            let provider = FileSystemSkillProvider::new(SkillFileSystemConfig {
+                include_default_roots: true,
+                dsh_home: home.path().join(".dsh"),
+                agents_home: home.path().join(".agents"),
+                custom_skill_dirs: Vec::new(),
+                bundled_skill_dir: None,
+            })?
+            .with_watching(
+                control.clone(),
+                SkillWatchConfig {
+                    poll_interval: std::time::Duration::from_millis(10),
+                },
+            );
+            Ok(Arc::new(provider))
+        })
+        .unwrap();
+    let registry_for_wait = registry.clone();
     let skill_tool = Arc::new(SkillTool::new(Arc::new(registry)));
     let mut tools = ToolRegistry::new();
     tools.register(skill_tool.clone());
@@ -326,6 +337,7 @@ async fn agent_replaces_changed_catalogs_and_publishes_an_empty_tombstone() {
         "---\nname: second-skill\ndescription: Second skill\n---\n\nSecond body.\n",
     )
     .unwrap();
+    wait_for_catalog(&registry_for_wait, 2).await;
     agent
         .run_turn(log.clone(), "second turn".into())
         .await
@@ -372,6 +384,7 @@ async fn agent_replaces_changed_catalogs_and_publishes_an_empty_tombstone() {
 
     std::fs::remove_dir_all(skills.join("first-skill")).unwrap();
     std::fs::remove_dir_all(skills.join("second-skill")).unwrap();
+    wait_for_catalog(&registry_for_wait, 0).await;
     agent
         .run_turn(log.clone(), "third turn".into())
         .await
@@ -407,6 +420,17 @@ async fn agent_replaces_changed_catalogs_and_publishes_an_empty_tombstone() {
         .await
         .unwrap();
     assert_eq!(published_catalogs(&log).len(), 3);
+}
+
+async fn wait_for_catalog(registry: &SkillRegistry, expected: usize) {
+    for _ in 0..200 {
+        let summaries = registry.list(&SkillViewOptions::default()).await.unwrap();
+        if summaries.len() == expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("skill catalog did not refresh to {expected} entries in time");
 }
 
 fn published_catalogs(log: &Arc<SessionLog>) -> Vec<SkillCatalogPublished> {
@@ -458,4 +482,164 @@ async fn skill_catalog_and_injection_follow_tool_visibility() {
             EventKind::SkillCatalogPublished { .. } | EventKind::SkillInvocationInjected { .. }
         )
     }));
+}
+
+#[tokio::test]
+async fn skill_catalog_follows_exact_identity_tool_visibility_by_scope() {
+    let registry = SkillRegistry::new();
+    registry
+        .register_runtime(
+            "a-skill",
+            "A skill",
+            "Body.",
+            SkillInvocationPolicy::default(),
+        )
+        .unwrap();
+    let skill_tool = Arc::new(SkillTool::new(Arc::new(registry)));
+
+    let preset_a = SkillScope::new();
+    let preset_b = SkillScope::new();
+
+    let mut tools = ToolRegistry::new();
+    // The `skill` tool is registered only in preset B's scope. A session on
+    // preset A must not publish the catalog, even though the skill tool object
+    // exists — exact-identity `get(name, scope)` reads it as absent.
+    tools
+        .register_for_scope(preset_b.clone(), skill_tool.clone())
+        .unwrap();
+
+    let adapter = Arc::new(RecordingAdapter {
+        requests: std::sync::Mutex::new(Vec::new()),
+    });
+    let agent = AgentLoop::new(adapter, Arc::new(tools))
+        .with_skill_tool(skill_tool)
+        .with_max_steps(1);
+
+    let log = Arc::new(SessionLog::in_memory(Uuid::new_v4()));
+    let agent_scope = SkillScope::new();
+    let binding = agent_scope.bind_parent(preset_a.clone()).unwrap();
+    log.set_skill_scope(agent_scope.clone());
+
+    agent
+        .run_turn(log.clone(), "first turn".into())
+        .await
+        .unwrap();
+    assert!(published_catalogs(&log).is_empty());
+
+    // Re-linking the session to preset B makes the scoped `skill` tool visible,
+    // so the catalog publishes.
+    binding.rebind(preset_b.clone()).unwrap();
+    agent
+        .run_turn(log.clone(), "second turn".into())
+        .await
+        .unwrap();
+    let catalogs = published_catalogs(&log);
+    assert_eq!(catalogs.len(), 1);
+    assert!(!catalogs[0].update);
+    assert_eq!(
+        catalogs[0]
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a-skill"]
+    );
+}
+
+#[tokio::test]
+async fn session_resolved_skills_change_after_preset_recomposition() {
+    let registry = SkillRegistry::new();
+    registry
+        .register_runtime(
+            "global",
+            "Global skill",
+            "Global body.",
+            SkillInvocationPolicy::default(),
+        )
+        .unwrap();
+
+    let preset_a = SkillScope::new();
+    registry
+        .register_runtime_for_scope(
+            preset_a.clone(),
+            "a-only",
+            "Preset A skill",
+            "A body.",
+            SkillInvocationPolicy::default(),
+        )
+        .unwrap();
+
+    let preset_b = SkillScope::new();
+    registry
+        .register_runtime_for_scope(
+            preset_b.clone(),
+            "b-only",
+            "Preset B skill",
+            "B body.",
+            SkillInvocationPolicy::default(),
+        )
+        .unwrap();
+
+    // The session owns its agent scope key, initially parented to preset A,
+    // mirroring the standing mount join installed during agent creation.
+    let log = Arc::new(SessionLog::in_memory(Uuid::new_v4()));
+    let agent_scope = SkillScope::new();
+    let binding = agent_scope.bind_parent(preset_a.clone()).unwrap();
+    log.set_skill_scope(agent_scope.clone());
+
+    let skill_tool = Arc::new(SkillTool::new(Arc::new(registry)));
+    let mut tools = ToolRegistry::new();
+    tools.register(skill_tool.clone());
+    let adapter = Arc::new(RecordingAdapter {
+        requests: std::sync::Mutex::new(Vec::new()),
+    });
+    let agent = AgentLoop::new(adapter.clone(), Arc::new(tools))
+        .with_skill_tool(skill_tool)
+        .with_max_steps(1);
+
+    agent
+        .run_turn(log.clone(), "first turn".into())
+        .await
+        .unwrap();
+    let catalogs = published_catalogs(&log);
+    assert_eq!(catalogs.len(), 1);
+    assert!(!catalogs[0].update);
+    assert_eq!(
+        catalogs[0]
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a-only", "global"]
+    );
+
+    // Recomposition re-links the still-blank session's scope key to preset B.
+    binding.rebind(preset_b.clone()).unwrap();
+
+    agent
+        .run_turn(log.clone(), "second turn".into())
+        .await
+        .unwrap();
+    let catalogs = published_catalogs(&log);
+    assert_eq!(catalogs.len(), 2);
+    assert!(catalogs[1].update);
+    assert_eq!(
+        catalogs[1]
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["b-only", "global"]
+    );
+
+    // The recomposed catalog reaches the model as the replacement list.
+    let requests = adapter.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    let model_catalog = user_contents(&requests[1])
+        .into_iter()
+        .find(|content| content.contains("The available skill catalog changed"))
+        .expect("recomposed catalog should reach the model");
+    assert!(model_catalog.contains("- `b-only`: Preset B skill"));
+    assert!(model_catalog.contains("- `global`: Global skill"));
+    assert!(!model_catalog.contains("a-only"));
 }

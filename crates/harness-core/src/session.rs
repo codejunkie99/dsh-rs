@@ -10,6 +10,8 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use uuid::Uuid;
 
+use crate::skills::SkillScope;
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "role")]
 pub enum TranscriptEntry {
@@ -60,6 +62,7 @@ pub struct SessionLog {
     path: Option<PathBuf>,
     inner: RwLock<SessionInner>,
     sequence_tx: watch::Sender<u64>,
+    skill_scope: RwLock<Option<SkillScope>>,
 }
 
 #[derive(Debug)]
@@ -86,6 +89,7 @@ impl SessionLog {
             id: session_id,
             path,
             sequence_tx: watch::Sender::new(0),
+            skill_scope: RwLock::new(None),
             inner: RwLock::new(SessionInner {
                 events: Vec::new(),
                 title: "New session".into(),
@@ -137,6 +141,18 @@ impl SessionLog {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The agent's scope key for this session, mapping the upstream agent's
+    /// own `dsh-scope` key. This is a live, identity-compared link; it is not
+    /// persisted with the JSONL event log. A preset roster parents the key to
+    /// a standing preset scope and may later re-link it for a blank session.
+    pub fn set_skill_scope(&self, scope: SkillScope) {
+        *self.skill_scope.write() = Some(scope);
+    }
+
+    pub fn skill_scope(&self) -> Option<SkillScope> {
+        self.skill_scope.read().clone()
     }
 
     pub fn events(&self) -> Vec<SessionEvent> {

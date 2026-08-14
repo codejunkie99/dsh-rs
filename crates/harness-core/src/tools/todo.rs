@@ -3,7 +3,7 @@ use crate::session::SharedSessionLog;
 use crate::tools::{Tool, ToolInvocation, ToolOutput, ToolSpec};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashSet;
 
 pub struct TodoTool {
@@ -89,18 +89,15 @@ impl TodoTool {
             .iter()
             .filter(|todo| todo.status == TodoStatus::Pending)
             .count();
-        let value = TodoWriteOutput {
-            todos,
-            counts: TodoCounts {
-                pending,
-                in_progress,
-                completed,
-            },
-        };
-        Ok(ToolOutput {
-            ok: true,
-            output: serde_json::to_string(&value)?,
-        })
+        // Upstream `tool-todo` renders the model-facing result as a single
+        // human-readable line, not the raw canonical value JSON
+        // (`packages/todo/tool-todo/src/index.ts`, `output.render`):
+        // `Updated todo list: {pending} pending, {inProgress} in progress,
+        // {completed} completed.`
+        let output = format!(
+            "Updated todo list: {pending} pending, {in_progress} in progress, {completed} completed."
+        );
+        Ok(ToolOutput { ok: true, output })
     }
 }
 
@@ -115,20 +112,6 @@ struct TodoWriteArguments {
 struct TodoInput {
     content: String,
     status: TodoStatus,
-}
-
-#[derive(Serialize)]
-struct TodoWriteOutput {
-    todos: Vec<TodoItem>,
-    counts: TodoCounts,
-}
-
-#[derive(Serialize)]
-struct TodoCounts {
-    pending: usize,
-    #[serde(rename = "inProgress")]
-    in_progress: usize,
-    completed: usize,
 }
 
 #[async_trait]
@@ -277,14 +260,9 @@ mod tests {
             Some(log.clone()),
         );
         assert!(second.ok);
-        let value: serde_json::Value = serde_json::from_str(&second.output).unwrap();
         assert_eq!(
-            value["counts"],
-            serde_json::json!({
-                "pending": 0,
-                "inProgress": 1,
-                "completed": 1
-            })
+            second.output,
+            "Updated todo list: 0 pending, 1 in progress, 1 completed."
         );
         assert_eq!(
             log.view().todos.as_deref().unwrap()[0].status,

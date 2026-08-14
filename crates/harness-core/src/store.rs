@@ -1,5 +1,7 @@
 use crate::events::EventKind;
+use crate::preset::{PresetRoster, StandingProviderFactory};
 use crate::session::{SessionLog, SessionView, SharedSessionLog};
+use crate::skills::SkillScope;
 use anyhow::Result;
 use parking_lot::RwLock;
 use serde::Serialize;
@@ -37,12 +39,38 @@ pub struct SessionStore {
     root: PathBuf,
     logs: RwLock<Vec<SharedSessionLog>>,
     load_errors: RwLock<Vec<String>>,
+    roster: RwLock<PresetRoster>,
 }
 
 impl SessionStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_with_default_preset(root, "standard")
+    }
+
+    pub fn open_with_default_preset(
+        root: impl Into<PathBuf>,
+        default_preset_id: &str,
+    ) -> Result<Self> {
+        Self::open_with_default_preset_and_provider(root, default_preset_id, None)
+    }
+
+    /// Open a session store whose preset roster mounts a per-standing-scope
+    /// provider (for example, the filesystem skill provider) whenever a preset
+    /// is first composed. The factory is installed before any session joins,
+    /// so existing sessions loaded during open receive the provider on reopen.
+    pub fn open_with_default_preset_and_provider(
+        root: impl Into<PathBuf>,
+        default_preset_id: &str,
+        provider_factory: Option<StandingProviderFactory>,
+    ) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
+        let roster = RwLock::new(match provider_factory {
+            Some(factory) => {
+                PresetRoster::with_standing_provider_factory(default_preset_id.to_string(), factory)
+            }
+            None => PresetRoster::new(default_preset_id.to_string()),
+        });
         let mut logs = Vec::new();
         let mut load_errors = Vec::new();
 
@@ -53,7 +81,17 @@ impl SessionStore {
                 continue;
             }
             match SessionLog::open(&path) {
-                Ok(log) => logs.push(std::sync::Arc::new(log)),
+                Ok(log) => {
+                    let log = std::sync::Arc::new(log);
+                    let harness_id = log.view().harness_id.clone();
+                    if let Err(error) = join_preset(&log, &roster, harness_id.as_deref()) {
+                        load_errors.push(format!(
+                            "{}: could not join preset scope: {error}",
+                            path.display()
+                        ));
+                    }
+                    logs.push(log);
+                }
                 Err(error) => load_errors.push(format!("{}: {error}", path.display())),
             }
         }
@@ -63,6 +101,7 @@ impl SessionStore {
             root,
             logs: RwLock::new(logs),
             load_errors: RwLock::new(load_errors),
+            roster,
         })
     }
 
@@ -117,8 +156,9 @@ impl SessionStore {
             title: Some(title.into()),
             model,
             space_id,
-            harness_id,
+            harness_id: harness_id.clone(),
         })?;
+        join_preset(&log, &self.roster, harness_id.as_deref())?;
         self.logs.write().push(log.clone());
         Ok(log)
     }
@@ -140,10 +180,12 @@ impl SessionStore {
     }
 
     pub fn set_harness(&self, id: Uuid, harness_id: impl Into<String>) -> Result<SharedSessionLog> {
+        let harness_id = harness_id.into();
         let log = self
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("session {id} does not exist"))?;
-        log.set_harness(harness_id)?;
+        log.set_harness(harness_id.as_str())?;
+        rejoin_preset(&log, &self.roster, &harness_id)?;
         Ok(log)
     }
 
@@ -173,6 +215,8 @@ impl SessionStore {
             fork.append_with_metadata(event.kind.clone(), event.metadata.clone())?;
         }
         fork.set_title(title)?;
+        let harness_id = fork.view().harness_id.clone();
+        join_preset(&fork, &self.roster, harness_id.as_deref())?;
         self.logs.write().push(fork.clone());
         Ok(fork)
     }
@@ -263,6 +307,38 @@ impl SessionStore {
             updated_at: view.updated_at,
         }
     }
+}
+
+/// Assign a fresh session scope parented to `harness_id`'s standing key (a
+/// first bind). Falls back to the roster default when the session names none.
+fn join_preset(
+    log: &SharedSessionLog,
+    roster: &RwLock<PresetRoster>,
+    harness_id: Option<&str>,
+) -> Result<()> {
+    let scope = SkillScope::new();
+    roster.write().mount(scope.clone(), harness_id)?;
+    log.set_skill_scope(scope);
+    Ok(())
+}
+
+/// Re-link an already-joined session scope to a different preset's standing
+/// key, or first-bind it when no scope was assigned yet.
+fn rejoin_preset(
+    log: &SharedSessionLog,
+    roster: &RwLock<PresetRoster>,
+    harness_id: &str,
+) -> Result<()> {
+    let mut roster = roster.write();
+    match log.skill_scope() {
+        Some(scope) => roster.recompose(scope, harness_id)?,
+        None => {
+            let scope = SkillScope::new();
+            roster.mount(scope.clone(), Some(harness_id))?;
+            log.set_skill_scope(scope);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -455,5 +531,104 @@ mod tests {
         assert!(markdown.contains("hello export"));
         assert!(markdown.contains("## Assistant"));
         assert!(markdown.contains("exported"));
+    }
+
+    #[test]
+    fn sessions_on_the_same_preset_share_the_standing_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let a = store
+            .create_in_space_and_harness("A", None, None, Some("standard".into()))
+            .unwrap();
+        let b = store
+            .create_in_space_and_harness("B", None, None, Some("standard".into()))
+            .unwrap();
+        let c = store
+            .create_in_space_and_harness("C", None, None, Some("research".into()))
+            .unwrap();
+
+        assert_eq!(
+            a.skill_scope().unwrap().parent(),
+            b.skill_scope().unwrap().parent()
+        );
+        assert_ne!(
+            a.skill_scope().unwrap().parent(),
+            c.skill_scope().unwrap().parent()
+        );
+    }
+
+    #[test]
+    fn set_harness_relinks_the_session_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let session = store
+            .create_in_space_and_harness("A", None, None, Some("standard".into()))
+            .unwrap();
+        let standard_parent = session.skill_scope().unwrap().parent().unwrap();
+
+        store.set_harness(session.id(), "research").unwrap();
+
+        let research_parent = session.skill_scope().unwrap().parent().unwrap();
+        assert_ne!(standard_parent, research_parent);
+        assert_eq!(session.view().harness_id.as_deref(), Some("research"));
+    }
+
+    #[test]
+    fn reopened_sessions_remount_their_recorded_preset_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let standard = store
+            .create_in_space_and_harness("A", None, None, Some("standard".into()))
+            .unwrap();
+        let research = store
+            .create_in_space_and_harness("B", None, None, Some("research".into()))
+            .unwrap();
+        drop(store);
+
+        let reopened = SessionStore::open(dir.path()).unwrap();
+        let reopened_standard = reopened.get(standard.id()).unwrap();
+        let reopened_research = reopened.get(research.id()).unwrap();
+        let fresh_standard = reopened
+            .create_in_space_and_harness("C", None, None, Some("standard".into()))
+            .unwrap();
+        let fresh_research = reopened
+            .create_in_space_and_harness("D", None, None, Some("research".into()))
+            .unwrap();
+
+        assert_eq!(
+            reopened_standard.skill_scope().unwrap().parent(),
+            fresh_standard.skill_scope().unwrap().parent()
+        );
+        assert_eq!(
+            reopened_research.skill_scope().unwrap().parent(),
+            fresh_research.skill_scope().unwrap().parent()
+        );
+        assert_ne!(
+            reopened_standard.skill_scope().unwrap().parent(),
+            reopened_research.skill_scope().unwrap().parent()
+        );
+    }
+
+    #[test]
+    fn forks_join_the_source_preset_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(dir.path()).unwrap();
+        let source = store
+            .create_in_space_and_harness("Source", None, None, Some("research".into()))
+            .unwrap();
+        source
+            .append(EventKind::UserMessage {
+                id: Uuid::new_v4(),
+                content: "hello".into(),
+            })
+            .unwrap();
+
+        let fork = store.fork(source.id(), None, "Fork").unwrap();
+
+        assert_eq!(fork.view().harness_id.as_deref(), Some("research"));
+        assert_eq!(
+            fork.skill_scope().unwrap().parent(),
+            source.skill_scope().unwrap().parent()
+        );
     }
 }
