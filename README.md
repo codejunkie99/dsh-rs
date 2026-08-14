@@ -33,6 +33,13 @@ A native Rust + GPUI desktop milestone for the DeepSeek Harness agent model. It 
 - Keyboard text editing with clipboard, selection, cursor, and IME hooks.
 - Built-in local null adapter for deterministic, network-free verification.
 
+## Progress
+
+See [PROGRESS.md](PROGRESS.md) for the continuously refreshed parity board. The
+loop runner updates it after each cycle through
+`scripts/update-progress-board.py`; evidence-backed runners can change an
+estimate with a one-line `PROGRESS_JSON:` record.
+
 ## Build
 
 ```sh
