@@ -8,7 +8,9 @@ use gpui::{
 use input::{
     Backspace, Copy, Cut, Delete, End, Home, Left, Paste, Right, SelectAll, SelectLeft, SelectRight,
 };
-use workspace::{CancelTurn, NewSession, RenameSession, SearchSessions, Submit, Workspace};
+use workspace::{
+    CancelTurn, NewSession, RenameSession, SaveCredential, SearchSessions, Submit, Workspace,
+};
 
 const APP_TITLE: &str = "DeepSeek Harness RS";
 actions!(dsh_app, [Quit]);
@@ -19,6 +21,7 @@ fn main() {
             KeyBinding::new("enter", Submit, Some("ChatInput")),
             KeyBinding::new("enter", SearchSessions, Some("SearchInput")),
             KeyBinding::new("enter", RenameSession, Some("RenameInput")),
+            KeyBinding::new("enter", SaveCredential, Some("ApiKeyInput")),
             KeyBinding::new("cmd-n", NewSession, Some("Workspace")),
             KeyBinding::new("cmd-.", CancelTurn, Some("Workspace")),
             KeyBinding::new("backspace", Backspace, None),

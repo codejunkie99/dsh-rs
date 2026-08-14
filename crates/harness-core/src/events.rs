@@ -13,6 +13,9 @@ pub enum EventKind {
     SessionTitleChanged {
         title: String,
     },
+    SessionModelChanged {
+        model: String,
+    },
     SystemPromptSnapshot {
         content: Option<String>,
     },

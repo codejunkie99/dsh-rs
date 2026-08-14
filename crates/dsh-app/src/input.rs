@@ -7,6 +7,7 @@ use gpui::{
     UTF16Selection, Window,
 };
 use unicode_segmentation::UnicodeSegmentation;
+use zeroize::Zeroize;
 
 actions!(
     input,
@@ -38,6 +39,10 @@ mod kind_tests {
         assert_eq!(InputKind::Search.placeholder(), "Search sessions");
         assert_eq!(InputKind::Rename.key_context(), "RenameInput");
         assert_eq!(InputKind::Rename.placeholder(), "Session title");
+        assert_eq!(InputKind::ApiKey.key_context(), "ApiKeyInput");
+        assert_eq!(InputKind::ApiKey.placeholder(), "DeepSeek API key");
+        assert!(InputKind::ApiKey.masks_content());
+        assert!(!InputKind::Chat.masks_content());
     }
 }
 
@@ -46,6 +51,7 @@ pub enum InputKind {
     Chat,
     Search,
     Rename,
+    ApiKey,
 }
 
 impl InputKind {
@@ -54,6 +60,7 @@ impl InputKind {
             Self::Chat => "ChatInput",
             Self::Search => "SearchInput",
             Self::Rename => "RenameInput",
+            Self::ApiKey => "ApiKeyInput",
         }
     }
 
@@ -62,7 +69,12 @@ impl InputKind {
             Self::Chat => "Message DeepSeek Harness",
             Self::Search => "Search sessions",
             Self::Rename => "Session title",
+            Self::ApiKey => "DeepSeek API key",
         }
+    }
+
+    pub fn masks_content(self) -> bool {
+        matches!(self, Self::ApiKey)
     }
 }
 
@@ -102,7 +114,10 @@ impl ChatInput {
     }
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
-        self.content = text.into();
+        let new_text = text.into();
+        let mut old_content = std::mem::take(&mut self.content);
+        old_content.zeroize();
+        self.content = new_text;
         self.selected_range = self.content.len()..self.content.len();
         self.selection_reversed = false;
         self.marked_range = None;
@@ -110,7 +125,8 @@ impl ChatInput {
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
-        self.content.clear();
+        let mut old_content = std::mem::take(&mut self.content);
+        old_content.zeroize();
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.marked_range = None;
@@ -160,7 +176,18 @@ impl ChatInput {
     }
 
     fn replace_range(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
-        self.content.replace_range(range.clone(), text);
+        if self.kind.masks_content() {
+            let old_content = std::mem::take(&mut self.content);
+            let mut prefix = old_content[..range.start].to_string();
+            let mut suffix = old_content[range.end..].to_string();
+            let mut old_content = old_content;
+            old_content.zeroize();
+            self.content = format!("{prefix}{text}{suffix}");
+            prefix.zeroize();
+            suffix.zeroize();
+        } else {
+            self.content.replace_range(range.clone(), text);
+        }
         let cursor = range.start + text.len();
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
@@ -224,7 +251,7 @@ impl ChatInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        if !self.kind.masks_content() && !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
@@ -232,7 +259,7 @@ impl ChatInput {
     }
 
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        if !self.kind.masks_content() && !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
@@ -421,11 +448,16 @@ impl Element for ChatTextElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
-        let display = if input.content.is_empty() {
-            input.placeholder.to_string()
+        let raw_display = if input.content.is_empty() {
+            None
         } else {
-            input.content.clone()
+            Some(if input.kind.masks_content() {
+                "*".repeat(input.content.len())
+            } else {
+                input.content.clone()
+            })
         };
+        let display = raw_display.unwrap_or_else(|| input.placeholder.to_string());
         let style = window.text_style();
         let color = if input.content.is_empty() {
             hsla(0., 0., 1., 0.35)
