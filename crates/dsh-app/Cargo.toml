@@ -10,3 +10,4 @@ harness-core = { path = "../harness-core" }
 unicode-segmentation = "1"
 uuid.workspace = true
 tokio.workspace = true
+zeroize.workspace = true

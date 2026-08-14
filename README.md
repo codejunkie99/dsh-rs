@@ -15,6 +15,7 @@ A native Rust + GPUI desktop milestone for the DeepSeek Harness agent model. It 
 - Adapter-driven turn/step agent loop.
 - Durable system-prompt configuration with per-session prompt snapshots and deterministic model history projection.
 - DeepSeek OpenAI-compatible streaming adapter with environment and private credential-file key resolution.
+- Native masked API-key management with atomic owner-only storage and immediate model reload.
 - Transient model-request retry handling for network errors, timeouts, HTTP 408/429, and 5xx responses.
 - Live transcript and session-state refresh driven by append-only event notifications.
 - Tool registry and echo tool execution path.
@@ -84,13 +85,13 @@ Set a key in the environment:
 export DEEPSEEK_API_KEY="..."
 ```
 
-Or create a private credential file:
+Or enter a key in the sidebar's **Model Access** field. Saving writes it atomically to:
 
 ```sh
-mkdir -p ~/.dsh-rs
-printf 'api_key = ...\n' > ~/.dsh-rs/credentials
-chmod 600 ~/.dsh-rs/credentials
+~/.dsh-rs/credentials
 ```
+
+The credential directory is tightened to `0700`, and the file is published with mode `0600`. The field masks and zeroizes its draft; saved keys are never echoed or written to session logs. Removing the stored key immediately returns the app to the local adapter. A nonempty `DEEPSEEK_API_KEY` in the launching environment remains the read-only override and disables in-app writes so a stored replacement cannot appear to take effect.
 
 Optional settings:
 
@@ -155,6 +156,6 @@ This build uses GPUI's `runtime_shaders` feature so it can build and run with th
 
 ## Current limits
 
-- Remote streaming retries are implemented, but credential management UI and circuit-break telemetry are not implemented yet.
+- Remote streaming retries are implemented, but circuit-break telemetry is not implemented yet.
 - The editor is a focused native single-line chat input, not a full multiline code editor.
 - Read/list/write filesystem tools are scoped and enabled. Shell execution is direct-execution and explicitly allowlisted, not a general `/bin/sh` sandbox. OS-level sandbox profiles remain future work.

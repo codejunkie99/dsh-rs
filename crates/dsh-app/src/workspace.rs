@@ -6,15 +6,18 @@ use gpui::{
     Window,
 };
 use harness_core::agent::AgentLoop;
-use harness_core::approval::{ApprovalPolicy, ApprovalRequest, ChannelApprover, GatedApprover};
+use harness_core::approval::{
+    ApprovalPolicy, ApprovalRequest, ChannelApprover, GatedApprover, ToolApprover,
+};
 use harness_core::cancellation::TurnCancellation;
 use harness_core::prompt::SystemPromptConfig;
-use harness_core::remote::ModelSelection;
+use harness_core::remote::{CredentialStore, ModelSelection};
 use harness_core::session::{SessionView, TranscriptEntry};
 use harness_core::store::{SessionStore, SessionSummary};
 use harness_core::tools::fs::{ListDirTool, ReadFileTool, ScopedFs, WriteFileTool};
 use harness_core::tools::shell::{CommandTool, ShellPolicy};
 use harness_core::tools::{EchoTool, ToolRegistry};
+use zeroize::Zeroize;
 
 actions!(
     workspace,
@@ -23,7 +26,8 @@ actions!(
         NewSession,
         CancelTurn,
         SearchSessions,
-        RenameSession
+        RenameSession,
+        SaveCredential
     ]
 );
 
@@ -33,12 +37,20 @@ pub struct Workspace {
     pub(crate) input: Entity<ChatInput>,
     search_input: Entity<ChatInput>,
     rename_input: Entity<ChatInput>,
+    credential_input: Entity<ChatInput>,
     summaries: Vec<SessionSummary>,
     selected: Option<harness_core::session::SharedSessionLog>,
     selected_view: Option<SessionView>,
     busy: bool,
     status: SharedString,
     model: String,
+    home: std::path::PathBuf,
+    credential_path: std::path::PathBuf,
+    credential_environment_override: bool,
+    credential_file_configured: bool,
+    tools: Arc<ToolRegistry>,
+    approver: Arc<dyn ToolApprover>,
+    system_prompt: Option<String>,
     pending_approval: Option<ApprovalRequest>,
     cancellation: Option<TurnCancellation>,
     search_matches: Option<Vec<uuid::Uuid>>,
@@ -49,10 +61,16 @@ impl Workspace {
         let input = cx.new(|cx| ChatInput::new(InputKind::Chat, cx));
         let search_input = cx.new(|cx| ChatInput::new(InputKind::Search, cx));
         let rename_input = cx.new(|cx| ChatInput::new(InputKind::Rename, cx));
+        let credential_input = cx.new(|cx| ChatInput::new(InputKind::ApiKey, cx));
         let root = Self::sessions_root();
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
+        let credential_path = CredentialStore::credential_path(Some(&home));
+        let credential_environment_override = std::env::var("DEEPSEEK_API_KEY")
+            .map(|key| !key.trim().is_empty())
+            .unwrap_or(false);
+        let credential_file_configured = CredentialStore::resolve(None, &credential_path).is_ok();
         let selection =
             ModelSelection::select_from_environment(Some(&home)).unwrap_or_else(|error| {
                 eprintln!("model selection failed: {error}");
@@ -105,33 +123,11 @@ impl Workspace {
             }
         };
 
-        let mut tools = ToolRegistry::new();
-        tools.register(Arc::new(EchoTool));
-        if let Ok(filesystem) = ScopedFs::new(home.join(".dsh-rs").join("workspace")) {
-            let filesystem = Arc::new(filesystem);
-            tools.register(Arc::new(ReadFileTool::new(filesystem.clone())));
-            tools.register(Arc::new(ListDirTool::new(filesystem.clone())));
-            tools.register(Arc::new(WriteFileTool::new(filesystem.clone())));
-
-            let shell_path = home.join(".dsh-rs").join("shell.json");
-            if !shell_path.exists() {
-                let _ = ShellPolicy::default()
-                    .canonicalize()
-                    .unwrap()
-                    .save(&shell_path);
-            }
-            match ShellPolicy::load(&shell_path) {
-                Ok(shell_policy) if !shell_policy.allowed_binaries.is_empty() => {
-                    tools.register(Arc::new(CommandTool::new(filesystem, shell_policy)));
-                }
-                Ok(_) => {}
-                Err(error) => eprintln!("shell policy load failed ({error}); shell stays disabled"),
-            }
-        }
-        let agent = AgentLoop::new(selection.adapter.clone(), Arc::new(tools))
+        let tools = Self::build_tools(&home);
+        let agent = AgentLoop::new(selection.adapter.clone(), tools.clone())
             .with_default_model(Some(selection.model.clone()))
-            .with_system_prompt(system_prompt)
-            .with_approver(approver)
+            .with_system_prompt(system_prompt.clone())
+            .with_approver(approver.clone())
             .with_max_steps(8);
 
         let mut workspace = Self {
@@ -140,12 +136,20 @@ impl Workspace {
             input,
             search_input,
             rename_input,
+            credential_input,
             summaries: Vec::new(),
             selected: None,
             selected_view: None,
             busy: false,
             status,
             model: selection.model.clone(),
+            home,
+            credential_path,
+            credential_environment_override,
+            credential_file_configured,
+            tools,
+            approver,
+            system_prompt,
             pending_approval: None,
             cancellation: None,
             search_matches: None,
@@ -185,6 +189,137 @@ impl Workspace {
             .unwrap_or_else(std::env::temp_dir)
             .join(".dsh-rs")
             .join("sessions")
+    }
+
+    fn build_tools(home: &std::path::Path) -> Arc<ToolRegistry> {
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        if let Ok(filesystem) = ScopedFs::new(home.join(".dsh-rs").join("workspace")) {
+            let filesystem = Arc::new(filesystem);
+            tools.register(Arc::new(ReadFileTool::new(filesystem.clone())));
+            tools.register(Arc::new(ListDirTool::new(filesystem.clone())));
+            tools.register(Arc::new(WriteFileTool::new(filesystem.clone())));
+
+            let shell_path = home.join(".dsh-rs").join("shell.json");
+            if !shell_path.exists() {
+                let _ = ShellPolicy::default()
+                    .canonicalize()
+                    .unwrap()
+                    .save(&shell_path);
+            }
+            match ShellPolicy::load(&shell_path) {
+                Ok(shell_policy) if !shell_policy.allowed_binaries.is_empty() => {
+                    tools.register(Arc::new(CommandTool::new(filesystem, shell_policy)));
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("shell policy load failed ({error}); shell stays disabled"),
+            }
+        }
+        Arc::new(tools)
+    }
+
+    fn reload_model(&mut self) -> Result<(), String> {
+        let selection = ModelSelection::select_from_environment(Some(&self.home))
+            .map_err(|error| error.to_string())?;
+        self.agent = AgentLoop::new(selection.adapter.clone(), self.tools.clone())
+            .with_default_model(Some(selection.model.clone()))
+            .with_system_prompt(self.system_prompt.clone())
+            .with_approver(self.approver.clone())
+            .with_max_steps(8);
+        self.model = selection.model;
+        Ok(())
+    }
+
+    fn credential_label(&self) -> &'static str {
+        if self.credential_environment_override {
+            "Environment key active"
+        } else if self.credential_file_configured {
+            "Stored key active"
+        } else {
+            "No stored key"
+        }
+    }
+
+    fn save_credential(&mut self, _: &SaveCredential, _: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            self.status = SharedString::from("Wait for the current turn to finish.");
+            cx.notify();
+            return;
+        }
+        if self.credential_environment_override {
+            self.status = SharedString::from(
+                "DEEPSEEK_API_KEY is set by the launching environment; stored keys stay read-only.",
+            );
+            cx.notify();
+            return;
+        }
+
+        let mut key = self.credential_input.read(cx).text();
+        let save_result = CredentialStore::save(&key, &self.credential_path);
+        key.zeroize();
+        if let Err(error) = save_result {
+            self.status = SharedString::from(format!("Could not save API key: {error}"));
+            cx.notify();
+            return;
+        }
+
+        self.credential_file_configured =
+            CredentialStore::resolve(None, &self.credential_path).is_ok();
+        self.credential_input
+            .update(cx, |input, cx| input.clear(cx));
+        match self.reload_model() {
+            Ok(()) => {
+                if let Some(selected) = &self.selected {
+                    let _ = selected.set_model(self.model.clone());
+                }
+                self.refresh();
+                self.status =
+                    SharedString::from(format!("API key saved. {} is connected.", self.model));
+            }
+            Err(error) => {
+                self.status =
+                    SharedString::from(format!("API key saved, but model reload failed: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn remove_credential(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            self.status = SharedString::from("Wait for the current turn to finish.");
+            cx.notify();
+            return;
+        }
+        match CredentialStore::remove(&self.credential_path) {
+            Ok(true) => {
+                self.credential_file_configured = false;
+                self.credential_input
+                    .update(cx, |input, cx| input.clear(cx));
+                match self.reload_model() {
+                    Ok(()) => {
+                        if let Some(selected) = &self.selected {
+                            let _ = selected.set_model(self.model.clone());
+                        }
+                        self.refresh();
+                        self.status = SharedString::from(if self.credential_environment_override {
+                            "Stored key removed. Environment key remains active."
+                        } else {
+                            "Stored key removed. Using the local adapter."
+                        });
+                    }
+                    Err(error) => {
+                        self.status = SharedString::from(format!("Model reload failed: {error}"));
+                    }
+                }
+            }
+            Ok(false) => {
+                self.status = SharedString::from("No stored API key to remove.");
+            }
+            Err(error) => {
+                self.status = SharedString::from(format!("Could not remove API key: {error}"));
+            }
+        }
+        cx.notify();
     }
 
     fn refresh(&mut self) {
@@ -430,7 +565,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let visible_summaries: Vec<SessionSummary> = match &self.search_matches {
             Some(matches) => self
                 .summaries
@@ -442,6 +577,7 @@ impl Workspace {
         };
 
         div()
+            .id("sessions-sidebar")
             .w(px(280.))
             .h_full()
             .flex()
@@ -449,6 +585,7 @@ impl Workspace {
             .bg(rgb(0x13161c))
             .border_r_1()
             .border_color(rgb(0x252b34))
+            .overflow_scroll()
             .p_3()
             .gap_2()
             .child(
@@ -543,6 +680,84 @@ impl Workspace {
                                 cx.listener(|workspace, _, _, cx| workspace.export_selected(cx)),
                             )
                             .child("Export"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .pt_2()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x8f9aa8))
+                            .child("MODEL ACCESS"),
+                    )
+                    .child(self.credential_input.clone())
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("save-credential")
+                                    .flex_1()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x246b53))
+                                    .text_size(px(12.))
+                                    .text_color(rgb(0xe8fff6))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .hover(|style| style.bg(rgb(0x2d8465)).cursor_pointer())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|workspace, _, window, cx| {
+                                            workspace.save_credential(&SaveCredential, window, cx)
+                                        }),
+                                    )
+                                    .child("Save Key"),
+                            )
+                            .child(
+                                div()
+                                    .id("remove-credential")
+                                    .flex_1()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(if self.credential_file_configured {
+                                        rgb(0x6b2424)
+                                    } else {
+                                        rgb(0x242b34)
+                                    })
+                                    .text_size(px(12.))
+                                    .text_color(rgb(0xffe8e8))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .hover(|style| style.bg(rgb(0x843030)).cursor_pointer())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|workspace, _, _, cx| {
+                                            workspace.remove_credential(cx)
+                                        }),
+                                    )
+                                    .child("Remove"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(if self.credential_environment_override {
+                                rgb(0xffd9a0)
+                            } else if self.credential_file_configured {
+                                rgb(0xd8f5e4)
+                            } else {
+                                rgb(0x818d9a)
+                            })
+                            .child(self.credential_label()),
                     ),
             )
             .children(visible_summaries.iter().map(|summary| {

@@ -162,6 +162,18 @@ impl SessionLog {
         self.append(EventKind::SessionTitleChanged { title })
     }
 
+    pub fn set_model(&self, model: impl Into<String>) -> Result<SessionEvent> {
+        let model = model.into();
+        if self.view().model.as_deref() == Some(model.as_str()) {
+            return Ok(self
+                .events()
+                .last()
+                .cloned()
+                .expect("session logs always contain at least one event"));
+        }
+        self.append(EventKind::SessionModelChanged { model })
+    }
+
     pub fn append_with_metadata(
         &self,
         kind: EventKind,
@@ -277,6 +289,7 @@ impl SessionLog {
                 inner.model = model.clone();
             }
             EventKind::SessionTitleChanged { title } => inner.title = title.clone(),
+            EventKind::SessionModelChanged { model } => inner.model = Some(model.clone()),
             EventKind::SystemPromptSnapshot { content } => inner.system_prompt = content.clone(),
             EventKind::TurnStarted => inner.turn_active = true,
             EventKind::TurnCompleted { reason } => {
@@ -400,6 +413,24 @@ mod tests {
 
         let reopened = SessionLog::open(path).unwrap();
         assert_eq!(reopened.view().system_prompt, None);
+    }
+
+    #[test]
+    fn model_changes_are_durable_and_replayable() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let path = dir.path().join(format!("{id}.jsonl"));
+        let log = SessionLog::with_path(id, Some(path.clone()));
+        log.append(EventKind::SessionStarted {
+            title: Some("Model test".into()),
+            model: Some("local-null".into()),
+        })
+        .unwrap();
+        log.set_model("deepseek-chat").unwrap();
+        drop(log);
+
+        let reopened = SessionLog::open(path).unwrap();
+        assert_eq!(reopened.view().model.as_deref(), Some("deepseek-chat"));
     }
 
     #[test]

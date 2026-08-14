@@ -97,9 +97,22 @@ impl Drop for ApiKey {
 pub struct CredentialStore;
 
 impl CredentialStore {
+    fn validate(value: &str) -> Result<&str> {
+        let value = value.trim();
+        if value.is_empty() {
+            bail!("DeepSeek API key is blank");
+        }
+        if !value.chars().all(|ch| ch.is_ascii_graphic()) {
+            bail!(
+                "DeepSeek API key contains characters no HTTP header can carry; paste the raw key only"
+            );
+        }
+        Ok(value)
+    }
+
     pub fn resolve(environment_key: Option<&str>, file: &Path) -> Result<ApiKey> {
         if let Some(key) = environment_key.map(str::trim).filter(|key| !key.is_empty()) {
-            return Ok(ApiKey::new(key));
+            return Ok(ApiKey::new(Self::validate(key)?));
         }
 
         if !file.exists() {
@@ -123,9 +136,77 @@ impl CredentialStore {
                 let (name, value) = line.split_once('=')?;
                 (name.trim() == "api_key").then(|| value.trim().trim_matches('"').to_string())
             })
-            .filter(|key| !key.is_empty())
             .ok_or_else(|| anyhow!("credential file does not contain api_key"))?;
+        Self::validate(&key)?;
         Ok(ApiKey::new(key))
+    }
+
+    pub fn save(api_key: &str, file: &Path) -> Result<()> {
+        let api_key = Self::validate(api_key)?;
+        if let Some(parent) = file.parent() {
+            if parent.exists() {
+                let mut permissions = std::fs::metadata(parent)?.permissions();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    permissions.set_mode(0o700);
+                }
+                std::fs::set_permissions(parent, permissions)?;
+            } else {
+                std::fs::create_dir_all(parent)?;
+                let mut permissions = std::fs::metadata(parent)?.permissions();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    permissions.set_mode(0o700);
+                }
+                std::fs::set_permissions(parent, permissions)?;
+            }
+        }
+
+        let temporary = file.with_file_name(format!(
+            ".{}.{}.tmp",
+            file.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("credentials"),
+            uuid::Uuid::new_v4()
+        ));
+        let result = (|| -> Result<()> {
+            use std::io::Write;
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .with_context(|| {
+                    format!("failed to create credential file {}", temporary.display())
+                })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = output.metadata()?.permissions();
+                permissions.set_mode(0o600);
+                output.set_permissions(permissions)?;
+            }
+            writeln!(output, "api_key = {api_key}")?;
+            output.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+
+        std::fs::rename(&temporary, file)
+            .with_context(|| format!("failed to publish credential file {}", file.display()))
+    }
+
+    pub fn remove(file: &Path) -> Result<bool> {
+        if !file.exists() {
+            return Ok(false);
+        }
+        std::fs::remove_file(file)
+            .with_context(|| format!("failed to remove credential file {}", file.display()))
+            .map(|()| true)
     }
 
     pub fn resolve_from_environment(home: Option<&Path>) -> Result<ApiKey> {
@@ -664,6 +745,73 @@ mod tests {
         }
         std::fs::set_permissions(&insecure, permissions).unwrap();
         assert!(super::CredentialStore::resolve(None, &insecure).is_err());
+    }
+
+    #[test]
+    fn credential_store_rejects_environment_keys_http_headers_cannot_carry() {
+        assert!(super::CredentialStore::resolve(
+            Some("sk-\u{1F600}key"),
+            std::path::Path::new("missing")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn credential_store_saves_private_atomic_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dsh-home").join("credentials");
+
+        super::CredentialStore::save(" sk-test_123 ", &path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "api_key = sk-test_123\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(
+            super::CredentialStore::resolve(None, &path)
+                .unwrap()
+                .expose(),
+            "sk-test_123"
+        );
+    }
+
+    #[test]
+    fn credential_store_rejects_keys_http_headers_cannot_carry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+
+        for candidate in ["", "   ", "sk bad", "sk-\u{1F600}key", "sk\nkey"] {
+            assert!(super::CredentialStore::save(candidate, &path).is_err());
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn credential_store_removes_stored_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        super::CredentialStore::save("sk-test-remove", &path).unwrap();
+
+        assert!(super::CredentialStore::remove(&path).unwrap());
+        assert!(!path.exists());
+        assert!(!super::CredentialStore::remove(&path).unwrap());
+        assert!(super::CredentialStore::resolve(None, &path).is_err());
     }
 
     #[test]
