@@ -4,6 +4,7 @@ pub mod cancellation;
 pub mod events;
 pub mod harness;
 pub mod llm;
+pub mod preset;
 pub mod prompt;
 pub mod remote;
 pub mod session;

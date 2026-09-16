@@ -30,13 +30,17 @@ use harness_core::approval::{
 use harness_core::cancellation::TurnCancellation;
 use harness_core::events::{TodoItem, TodoStatus};
 use harness_core::harness::{HarnessSetup, HarnessSetupsConfig};
+use harness_core::preset::StandingProviderFactory;
 use harness_core::prompt::SystemPromptConfig;
 use harness_core::remote::{CredentialStore, ModelSelection};
 use harness_core::session::{SessionView, TranscriptEntry};
-use harness_core::skills::{FileSystemSkillProvider, SkillFileSystemConfig, SkillRegistry};
+use harness_core::skills::{
+    FileSystemSkillProvider, SkillFileSystemConfig, SkillRegistry, SkillScope, SkillWatchConfig,
+};
 use harness_core::spaces::SpacesConfig;
 use harness_core::store::{SessionStore, SessionSummary};
-use harness_core::tools::fs::{ListDirTool, ReadFileTool, ScopedFs, WriteFileTool};
+use harness_core::tools::fs::{EditFileTool, ListDirTool, ReadFileTool, ScopedFs, WriteFileTool};
+use harness_core::tools::search::{GlobTool, GrepTool};
 use harness_core::tools::shell::{CommandTool, ShellPolicy};
 use harness_core::tools::{EchoTool, SkillTool, TodoTool, ToolRegistry};
 use zeroize::Zeroize;
@@ -197,6 +201,7 @@ pub struct Workspace {
     skill_picker_cache_key: Option<String>,
     skill_picker_loaded_generation: Option<u64>,
     skill_picker_request: u64,
+    skills: Arc<SkillRegistry>,
     terminal_tool: Option<Arc<CommandTool>>,
     approver: Arc<dyn ToolApprover>,
     changes: WorkspaceChangesState,
@@ -514,7 +519,13 @@ impl Workspace {
         let system_prompt = selected_harness.system_prompt().render();
         let (approval_channel, mut approval_requests) = ChannelApprover::channel();
         let approver = Arc::new(GatedApprover::new(approval_policy, approval_channel));
-        let (store, status) = match SessionStore::open(&root) {
+        let skills = Arc::new(SkillRegistry::new());
+        let skill_provider_factory = Self::skill_standing_provider_factory(&home, skills.clone());
+        let (store, status) = match SessionStore::open_with_default_preset_and_provider(
+            &root,
+            &selected_harness_id,
+            Some(skill_provider_factory),
+        ) {
             Ok(store) => {
                 let model_status = if selection.is_remote {
                     format!("Ready. DeepSeek model {} is connected.", selection.model)
@@ -525,7 +536,12 @@ impl Workspace {
             }
             Err(error) => {
                 let fallback = std::env::temp_dir().join("dsh-rs-sessions");
-                let store = SessionStore::open(&fallback).expect("temporary session store");
+                let store = SessionStore::open_with_default_preset_and_provider(
+                    &fallback,
+                    &selected_harness_id,
+                    Some(Self::skill_standing_provider_factory(&home, skills.clone())),
+                )
+                .expect("temporary session store");
                 (
                     Arc::new(store),
                     SharedString::from(format!(
@@ -551,8 +567,12 @@ impl Workspace {
             status
         };
 
-        let (tools, skill_tool) =
-            Self::build_tools_with_skills(&home, &workspace_root, &selected_harness);
+        let (tools, skill_tool) = Self::build_tools_with_skills(
+            &home,
+            &workspace_root,
+            &selected_harness,
+            skills.clone(),
+        );
         let terminal_tool = Self::build_terminal_tool(&home, &workspace_root);
         let agent = AgentLoop::new(selection.adapter.clone(), tools.clone())
             .with_default_model(Some(selection.model.clone()))
@@ -619,6 +639,7 @@ impl Workspace {
             skill_picker_cache_key: None,
             skill_picker_loaded_generation: None,
             skill_picker_request: 0,
+            skills,
             terminal_tool,
             approver,
             changes: WorkspaceChangesState::NotRepository,
@@ -661,6 +682,7 @@ impl Workspace {
             }
         })
         .detach();
+        workspace.subscribe_skill_registry(cx);
         workspace.load_skill_picker(cx);
         workspace.refresh();
         workspace.refresh_changes(cx);
@@ -717,13 +739,48 @@ impl Workspace {
         workspace_root: &std::path::Path,
         harness: &HarnessSetup,
     ) -> Arc<ToolRegistry> {
-        Self::build_tools_with_skills(home, workspace_root, harness).0
+        Self::build_tools_with_skills(
+            home,
+            workspace_root,
+            harness,
+            Arc::new(SkillRegistry::new()),
+        )
+        .0
+    }
+
+    /// The per-standing-preset-scope filesystem provider factory.
+    ///
+    /// Upstream `@deepseek-ai/dsh-skill-filesystem` calls
+    /// `ctx.skills.registerProvider(...)` from inside a preset's standing
+    /// composition (`packages/skill/skill-filesystem/src/index.ts:132`), so the
+    /// provider lives in the standing scope's layer rather than the global
+    /// layer. The roster invokes this factory whenever it first mints a preset
+    /// standing key.
+    fn skill_standing_provider_factory(
+        home: &std::path::Path,
+        skills: Arc<SkillRegistry>,
+    ) -> StandingProviderFactory {
+        let home = home.to_path_buf();
+        Arc::new(move |_preset_id: &str, scope: &SkillScope| {
+            skills.register_provider_for_scope_with_control(scope.clone(), |control| {
+                let provider = FileSystemSkillProvider::new(SkillFileSystemConfig {
+                    include_default_roots: true,
+                    dsh_home: home.join(".dsh"),
+                    agents_home: home.join(".agents"),
+                    custom_skill_dirs: Vec::new(),
+                    bundled_skill_dir: None,
+                })?
+                .with_watching(control.clone(), SkillWatchConfig::default());
+                Ok(Arc::new(provider))
+            })
+        })
     }
 
     fn build_tools_with_skills(
         home: &std::path::Path,
         workspace_root: &std::path::Path,
         harness: &HarnessSetup,
+        skills: Arc<SkillRegistry>,
     ) -> (Arc<ToolRegistry>, Option<Arc<SkillTool>>) {
         let mut tools = ToolRegistry::new();
         let mut skill_tool = None;
@@ -734,24 +791,12 @@ impl Workspace {
             tools.register(Arc::new(TodoTool::new(true)));
         }
         if harness.enables("skill") {
-            let mut skills = SkillRegistry::new();
-            let provider = FileSystemSkillProvider::new(SkillFileSystemConfig {
-                include_default_roots: true,
-                dsh_home: home.join(".dsh"),
-                agents_home: home.join(".agents"),
-                custom_skill_dirs: Vec::new(),
-                bundled_skill_dir: None,
-            });
-            if let Ok(provider) = provider {
-                if skills.register_provider(Arc::new(provider)).is_ok() {
-                    let tool = Arc::new(SkillTool::new(Arc::new(skills)).with_cwd(workspace_root));
-                    tools.register(tool.clone());
-                    skill_tool = Some(tool);
-                }
-            }
+            let tool = Arc::new(SkillTool::new(skills.clone()).with_cwd(workspace_root));
+            tools.register(tool.clone());
+            skill_tool = Some(tool);
         }
 
-        let needs_filesystem = ["read_file", "list_dir", "write_file", "run_command"]
+        let needs_filesystem = ["read", "list_dir", "write", "edit", "glob", "grep", "run_command"]
             .iter()
             .any(|tool| harness.enables(tool));
         if needs_filesystem {
@@ -759,14 +804,23 @@ impl Workspace {
                 return (Arc::new(tools), skill_tool);
             };
             let filesystem = Arc::new(filesystem);
-            if harness.enables("read_file") {
+            if harness.enables("read") {
                 tools.register(Arc::new(ReadFileTool::new(filesystem.clone())));
             }
             if harness.enables("list_dir") {
                 tools.register(Arc::new(ListDirTool::new(filesystem.clone())));
             }
-            if harness.enables("write_file") {
+            if harness.enables("write") {
                 tools.register(Arc::new(WriteFileTool::new(filesystem.clone())));
+            }
+            if harness.enables("edit") {
+                tools.register(Arc::new(EditFileTool::new(filesystem.clone())));
+            }
+            if harness.enables("glob") {
+                tools.register(Arc::new(GlobTool::new(filesystem.clone())));
+            }
+            if harness.enables("grep") {
+                tools.register(Arc::new(GrepTool::new(filesystem.clone())));
             }
 
             let shell_path = home.join(".dsh-rs").join("shell.json");
@@ -1100,6 +1154,7 @@ impl Workspace {
             self.skill_picker_loading = false;
             return;
         };
+        let scope = self.selected.as_ref().and_then(|log| log.skill_scope());
 
         self.skill_picker_loading = true;
         let workspace_handle = cx.entity();
@@ -1109,7 +1164,7 @@ impl Workspace {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
-                    runtime.block_on(skill_tool.slash_entries())
+                    runtime.block_on(skill_tool.slash_entries_for(scope))
                 })
                 .await;
 
@@ -1138,6 +1193,28 @@ impl Workspace {
                     cx.notify();
                 });
             });
+        })
+        .detach();
+    }
+
+    fn subscribe_skill_registry(&mut self, cx: &mut Context<Self>) {
+        let Some(skill_tool) = self.skill_tool.clone() else {
+            return;
+        };
+        let mut events = skill_tool.registry().subscribe();
+        let workspace_handle = cx.entity();
+        cx.spawn(async move |_, cx| loop {
+            match events.recv().await {
+                Ok(_) => {
+                    cx.update(|cx| {
+                        workspace_handle.update(cx, |workspace, cx| {
+                            workspace.refresh_skill_picker_catalog(cx);
+                        });
+                    });
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            }
         })
         .detach();
     }
@@ -1323,8 +1400,12 @@ impl Workspace {
             self.workspace_root = space.root().to_path_buf();
             self.selected_harness_id = harness_id;
             let harness = self.selected_harness();
-            let (tools, skill_tool) =
-                Self::build_tools_with_skills(&self.home, &self.workspace_root, &harness);
+            let (tools, skill_tool) = Self::build_tools_with_skills(
+                &self.home,
+                &self.workspace_root,
+                &harness,
+                self.skills.clone(),
+            );
             self.tools = tools;
             self.skill_tool = skill_tool;
             self.load_skill_picker(cx);
@@ -1355,8 +1436,12 @@ impl Workspace {
 
         self.workspace_root = space.root().to_path_buf();
         let harness = self.selected_harness();
-        let (tools, skill_tool) =
-            Self::build_tools_with_skills(&self.home, &self.workspace_root, &harness);
+        let (tools, skill_tool) = Self::build_tools_with_skills(
+            &self.home,
+            &self.workspace_root,
+            &harness,
+            self.skills.clone(),
+        );
         self.tools = tools;
         self.skill_tool = skill_tool;
         self.load_skill_picker(cx);
@@ -1526,8 +1611,12 @@ impl Workspace {
         };
 
         self.selected_harness_id = harness_id.to_string();
-        let (tools, skill_tool) =
-            Self::build_tools_with_skills(&self.home, &self.workspace_root, &harness);
+        let (tools, skill_tool) = Self::build_tools_with_skills(
+            &self.home,
+            &self.workspace_root,
+            &harness,
+            self.skills.clone(),
+        );
         self.tools = tools;
         self.skill_tool = skill_tool;
         self.load_skill_picker(cx);
@@ -1537,7 +1626,7 @@ impl Workspace {
             return;
         }
         if let Some(selected) = &self.selected {
-            if let Err(error) = selected.set_harness(harness_id) {
+            if let Err(error) = self.store.set_harness(selected.id(), harness_id) {
                 self.status = SharedString::from(format!("Could not save session setup: {error}"));
                 cx.notify();
                 return;
@@ -4592,7 +4681,7 @@ mod tests {
         let tools = Workspace::build_tools(home.path(), root.path(), harness);
         let output = futures::executor::block_on(tools.execute(ToolInvocation {
             call_id: "test".into(),
-            name: "read_file".into(),
+            name: "read".into(),
             arguments: serde_json::json!({"path": "hello.txt"}),
         }));
 
@@ -4634,16 +4723,28 @@ mod tests {
         )
         .unwrap();
         let setups = HarnessSetupsConfig::default();
+        let skills = Arc::new(SkillRegistry::new());
+        let factory = Workspace::skill_standing_provider_factory(home.path(), skills.clone());
+        let store = SessionStore::open_with_default_preset_and_provider(
+            home.path().join(".dsh-rs").join("sessions"),
+            "standard",
+            Some(factory),
+        )
+        .unwrap();
+        let session = store
+            .create_in_space_and_harness("Session", None, None, Some("standard".into()))
+            .unwrap();
 
         let (tools, skill_tool) = Workspace::build_tools_with_skills(
             home.path(),
             root.path(),
             setups.get("standard").unwrap(),
+            skills.clone(),
         );
         assert!(tools.specs().iter().any(|spec| spec.name == "skill"));
         let entries = skill_tool
             .expect("standard setup retains its pre-step skill handle")
-            .catalog_entries()
+            .catalog_entries_for(session.skill_scope())
             .await
             .unwrap();
         assert_eq!(
@@ -4658,6 +4759,7 @@ mod tests {
             home.path(),
             root.path(),
             setups.get("research").unwrap(),
+            skills,
         );
         assert!(missing.is_none());
     }
@@ -4843,7 +4945,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("hello.txt"), "setup root").unwrap();
         let setups = HarnessSetupsConfig::parse(
-            r#"{"setups":[{"id":"research","name":"Research","system_prompt":{"include_harness_identity":true,"persona":"Read only."},"enabled_tools":["read_file"],"max_steps":4}]}"#,
+            r#"{"setups":[{"id":"research","name":"Research","system_prompt":{"include_harness_identity":true,"persona":"Read only."},"enabled_tools":["read"],"max_steps":4}]}"#,
         )
         .unwrap();
         let setup = setups.get("research").unwrap();
@@ -4854,7 +4956,7 @@ mod tests {
             .into_iter()
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["read_file"]);
+        assert_eq!(names, vec!["read"]);
     }
 
     #[test]
